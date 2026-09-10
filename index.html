@@ -39,6 +39,16 @@
   .tag{display:inline-block;font-size:12px;padding:2px 9px;border-radius:20px;
     background:var(--gl);color:var(--g2);font-weight:700;margin-inline-start:6px}
   .tag.r{background:#fdecea;color:var(--red)}
+  .msgbox{margin-top:11px;border:1px solid var(--bd);border-radius:9px;overflow:hidden}
+  .msghd{display:flex;justify-content:space-between;align-items:center;
+    background:var(--gl);padding:7px 10px;font-size:12px;font-weight:700;color:var(--g2)}
+  .msgtx{padding:10px;font-size:13px;white-space:pre-wrap;color:var(--mut);
+    max-height:150px;overflow:auto;background:#fcfdfd}
+  .cp{border:1px solid var(--g);background:#fff;color:var(--g);border-radius:7px;
+    padding:4px 10px;font-size:12px;font-weight:700;cursor:pointer;font-family:inherit}
+  .cp.done{background:var(--g);color:#fff}
+  .phoneline{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+  .ph{direction:ltr;font-weight:700;color:var(--tx)}
   .buckets{display:flex;gap:7px;overflow-x:auto;padding-bottom:6px;margin-bottom:12px}
   .bk{flex:0 0 auto;border:1px solid var(--bd);background:var(--card);border-radius:20px;
     padding:8px 14px;font-size:13px;font-weight:600;color:var(--mut);cursor:pointer;
@@ -191,6 +201,29 @@ const DEFAULT_MSG2 =
 + 'وأي حاجة تانية تحتاجها، إحنا موجودين 💚';
 
 const MSG2_KEY = 'pharma_msg2_v1';
+const MSG3_KEY = 'pharma_msg3_v1';   // استطلاع رأي بعد شراء منتج تجميل
+const MSG4_KEY = 'pharma_msg4_v1';   // تذكير بإعادة شراء منتج تجميل
+
+const DEFAULT_MSG3 =
+  'أهلاً {اسم_العميل} 🌿\n'
++ 'معاك صيدلية أنس نحيلة.\n\n'
++ 'حابين نطمن، إيه رأيك في:\n'
++ '{الأدوية}\n\n'
++ 'ظبط معاك؟ حاسس بفرق؟\n'
++ 'لو فيه أي ملاحظة أو حاسس إنه مش مناسب لبشرتك، قولنا وهنرشحلك البديل المناسب 💚';
+
+const DEFAULT_MSG4 =
+  'أهلاً {اسم_العميل} 🌿\n'
++ 'معاك صيدلية أنس نحيلة.\n\n'
++ 'حسب آخر مرة، الظاهر إن ده قرب يخلص:\n'
++ '{الأدوية}\n\n'
++ 'متوفر عندنا، ولو تحب نوصلهولك البيت قولنا.\n'
++ 'وأي استفسار عن روتين العناية، إحنا موجودين 💚';
+
+const COSMETIC_CATS = ['GINERAL COSMO', 'MEDICAL COSMO'];
+const COSMETIC_MIN_PRICE = 200;
+const SATISFACTION_DAYS = 6;    // استطلاع الرأي بعد أسبوع تقريبًا
+const REPURCHASE_DAYS  = 45;    // تقدير عام لمنتجات العناية
 const CONSUMABLE_CATS = ['ألبان أطفال', 'حفاضات أطفال', 'حفاضات كبار'];
 
 let db = null, app = null;
@@ -208,7 +241,9 @@ let S = {
   bucket: 'all',
   drugQ: '',
   drugPick: '',
-  drugScope: 'all'
+  drugScope: 'all',
+  cosStage: 'cos_sat',
+  logStaff: '__all__'
 };
 
 const el = document.getElementById('app');
@@ -267,6 +302,10 @@ function saveMsg(v) { LS.set(MSG_KEY, v); }
 function getMsg()   { return LS.get(MSG_KEY) || DEFAULT_MSG; }
 function getMsg2()  { return LS.get(MSG2_KEY) || DEFAULT_MSG2; }
 function saveMsg2(v){ LS.set(MSG2_KEY, v); }
+function getMsg3()  { return LS.get(MSG3_KEY) || DEFAULT_MSG3; }
+function saveMsg3(v){ LS.set(MSG3_KEY, v); }
+function getMsg4()  { return LS.get(MSG4_KEY) || DEFAULT_MSG4; }
+function saveMsg4(v){ LS.set(MSG4_KEY, v); }
 
 // ============================ طبقة التخزين: Firestore ============================
 // نفس أسماء الدوال المستخدمة في النسخة المحلية، فباقي التطبيق ما اتغيرش.
@@ -428,7 +467,8 @@ async function uploadSales(file, setProg) {
 
   // 3) لكل (عميل + صنف مزمن): آخر تاريخ شراء
   setProg(35, 'جاري حساب مواعيد المتابعة...');
-  const pairs = new Map();   // "عميل\u0000صنف" -> {…}
+  const pairs = new Map();      // "عميل\u0000صنف" -> {…}  (مزمن)
+  const cosPairs = new Map();   // منتجات التجميل فوق الحد السعري
   let skippedGeneric = 0, noPhone = 0, scanned = 0;
 
   for (const r of salesRows) {
@@ -446,6 +486,23 @@ async function uploadSales(file, setProg) {
       itemMap.set(item, meta);
       newItems.push(meta);
     }
+
+    // منتجات التجميل: الفئة من نظام الكاشير + سعر الوحدة فوق الحد.
+    // السعر لوحده مش كافي — فيه أدوية كتير فوق 200 ج.
+    const posCat = String(pick(r, ['فئة التصنيف', 'التصنيف']) ?? '').trim();
+    if (COSMETIC_CATS.includes(posCat)) {
+      const qty  = parseFloat(pick(r, ['الكمية'])) || 1;
+      const tot  = parseFloat(pick(r, ['المجموع'])) || 0;
+      const unit = qty > 0 ? tot / qty : 0;
+      if (unit > COSMETIC_MIN_PRICE && dt) {
+        const ck = cust + '\u0000' + item;
+        const cur = cosPairs.get(ck);
+        if (!cur || dt > cur.lastPurchaseDate)
+          cosPairs.set(ck, { customerName: cust, itemName: item, posCat,
+                             price: Math.round(unit), lastPurchaseDate: dt });
+      }
+    }
+
     if (!meta.isChronic) continue;
 
     const key = cust + '\u0000' + item;
@@ -467,9 +524,10 @@ async function uploadSales(file, setProg) {
   for (const p of pairs.values()) {
     const phone = phoneOf.get(p.customerName) || null;
     if (!phone) noPhone++;
-    const id = (p.customerName + '__' + p.itemName).replace(/[/\\.#$\[\]]/g, '_').slice(0, 480);
+    const id = cleanId(p.customerName + '__' + p.itemName);
     const prev = prevById.get(id);
     rows.push({
+      kind: 'chronic',
       customerName: p.customerName,
       customerPhone: phone || '',
       phoneValid: !!phone,
@@ -482,8 +540,38 @@ async function uploadSales(file, setProg) {
       optedOut: prev ? !!prev.optedOut : false,
       status: (prev && prev.lastPurchaseDate === p.lastPurchaseDate) ? prev.status : 'pending',
       lastContactedAt: prev ? (prev.lastContactedAt || null) : null,
+      contactedBy: prev ? (prev.contactedBy || '') : '',
       assignedTo: prev ? (prev.assignedTo || '') : ''
     });
+  }
+
+  // 4b) صفوف منتجات التجميل — صفّان لكل شراء:
+  //     استطلاع رأي بعد أيام قليلة، وتذكير بإعادة الشراء بعد فترة أطول.
+  let cosCount = 0;
+  for (const c of cosPairs.values()) {
+    const phone = phoneOf.get(c.customerName) || null;
+    for (const [kind, days] of [['cos_sat', SATISFACTION_DAYS], ['cos_rep', REPURCHASE_DAYS]]) {
+      const id = cleanId(c.customerName + '__' + c.itemName + '__' + kind);
+      const prev = prevById.get(id);
+      rows.push({
+        kind,
+        customerName: c.customerName,
+        customerPhone: phone || '',
+        phoneValid: !!phone,
+        itemName: c.itemName,
+        category: c.posCat,
+        price: c.price,
+        cycleDays: days,
+        lastPurchaseDate: c.lastPurchaseDate,
+        dueDate: addDays(c.lastPurchaseDate, days),
+        optedOut: prev ? !!prev.optedOut : false,
+        status: (prev && prev.lastPurchaseDate === c.lastPurchaseDate) ? prev.status : 'pending',
+        lastContactedAt: prev ? (prev.lastContactedAt || null) : null,
+        contactedBy: prev ? (prev.contactedBy || '') : '',
+        assignedTo: prev ? (prev.assignedTo || '') : ''
+      });
+      cosCount++;
+    }
   }
 
   // 5) التوزيع بالتساوي على الموظفين النشطين (يعمل مع أي عدد)
@@ -496,11 +584,13 @@ async function uploadSales(file, setProg) {
     await writeChunks('items', newItems, r => r.itemName, null);
   }
   setProg(72, `جاري حفظ ${rows.length} متابعة...`);
-  await writeChunks('followups', rows, r => r.customerName + '__' + r.itemName, setProg, 72, 98);
+  await writeChunks('followups', rows,
+    r => r.customerName + '__' + r.itemName + (r.kind === 'chronic' ? '' : '__' + r.kind),
+    setProg, 72, 98);
 
   setProg(100, 'تم.');
   return {
-    scanned, saved: rows.length, newItems: newItems.length,
+    scanned, saved: rows.length, newItems: newItems.length, cosCount,
     noPhone, skippedGeneric,
     customers: new Set(rows.map(r => r.customerName)).size
   };
@@ -516,6 +606,7 @@ async function uploadSales(file, setProg) {
 function viewToday() {
   const t = todayStr();
   let due = S.followups.filter(f =>
+    (f.kind || 'chronic') === 'chronic' &&
     f.dueDate <= t && f.status === 'pending' && !f.optedOut && f.phoneValid);
 
   const names = [...new Set(S.followups.map(f => f.assignedTo).filter(Boolean))].sort();
@@ -536,6 +627,7 @@ function viewToday() {
   const horizon = addDays(t, SOON);
   const soonMap = new Map();
   for (const f of S.followups) {
+    if ((f.kind || 'chronic') !== 'chronic') continue;
     if (f.optedOut || !f.phoneValid) continue;
     if (f.status === 'returned') continue;
     if (!(f.dueDate > t && f.dueDate <= horizon)) continue;
@@ -577,6 +669,7 @@ function viewToday() {
 
   // إجماليات بالعملاء مش بالصفوف
   const allDue = S.followups.filter(f =>
+    (f.kind || 'chronic') === 'chronic' &&
     f.dueDate <= t && f.status === 'pending' && !f.optedOut && f.phoneValid);
   const allCust = new Set(allDue.map(f => f.customerName)).size;
   const doneToday = new Set(S.followups.filter(f =>
@@ -632,7 +725,10 @@ function viewToday() {
       ? `<span class="tag">${g.meds.length} أصناف</span>` : '';
     h += `<div class="row ${cls}">
       <div class="nm">${esc(g.name)}${tag}${count}</div>
-      <div class="meta">${esc(g.phone)}</div>
+      <div class="meta phoneline">
+        <span class="ph">${esc(g.phone)}</span>
+        <button class="cp" data-cpph="${esc(g.phone)}">نسخ الرقم</button>
+      </div>
       ${g.meds.map(m => {
         const l = daysBetween(m.dueDate, t);
         return `<div class="med">💊 ${esc(m.itemName)}
@@ -652,9 +748,16 @@ function viewToday() {
             `<option value="${esc(x.name)}" ${g.who === x.name ? 'selected' : ''}>${esc(x.name)}</option>`).join('')}
         </select>
       </div>
+      <div class="msgbox">
+        <div class="msghd">
+          <span>الرسالة الجاهزة</span>
+          <button class="cp" data-cpmsg="${gi}">نسخ الرسالة</button>
+        </div>
+        <div class="msgtx">${esc(buildMessage(g.name, g.meds, g.soon, 'chronic'))}</div>
+      </div>
       <div class="acts">
-        <button class="b wa" data-wa="${gi}">واتساب</button>
-        <button class="b ok" data-ret="${gi}">رجع</button>
+        <button class="b wa" data-done="${gi}">تم التواصل</button>
+        <button class="b ok" data-ret="${gi}">اشترى</button>
         <button class="b no" data-na="${gi}">مردش</button>
       </div>
       <button class="lnk" data-out="${gi}">إيقاف المتابعة لهذا العميل</button>
@@ -663,10 +766,58 @@ function viewToday() {
   return h;
 }
 
+// نسخ للحافظة مع تأكيد بصري على الزرار نفسه
+async function copyText(txt, btn) {
+  try {
+    await navigator.clipboard.writeText(txt);
+  } catch {
+    const ta = document.createElement('textarea');
+    ta.value = txt; ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta); ta.select();
+    try { document.execCommand('copy'); } catch {}
+    document.body.removeChild(ta);
+  }
+  if (btn) {
+    const old = btn.textContent;
+    btn.textContent = 'اتنسخ ✓';
+    btn.classList.add('done');
+    setTimeout(() => { btn.textContent = old; btn.classList.remove('done'); }, 1400);
+  }
+}
+
+// اسم العميل بعد تنظيف رموز الإدخال (للعرض في الرسالة فقط)
+function displayName(raw) {
+  const c = String(raw).replace(/[*~.]/g, ' ').replace(/\b[dD]\b/g, ' ')
+    .replace(/\d+\s*$/, '').replace(/\s+/g, ' ').trim();
+  return c || raw;
+}
+
+// بناء نص الرسالة حسب نوع المتابعة
+function buildMessage(name, meds, soon, kind) {
+  let tpl;
+  if (kind === 'cos_sat') tpl = getMsg3();
+  else if (kind === 'cos_rep') tpl = getMsg4();
+  else {
+    const all = [...meds, ...(soon || [])];
+    const allCons = all.length > 0 && all.every(m => CONSUMABLE_CATS.includes(m.category));
+    tpl = allCons ? getMsg2() : getMsg();
+  }
+  let list = meds.map(m => '• ' + m.itemName).join('\n');
+  if (soon && soon.length)
+    list += '\n\nوقرب يخلص كمان:\n' + soon.map(m => '• ' + m.itemName).join('\n');
+  return tpl.replaceAll('{اسم_العميل}', displayName(name))
+            .replaceAll('{الأدوية}', list)
+            .replaceAll('{اسم_الدواء}', list);
+}
+
 // الإجراء بيتطبق على كل أدوية العميل المستحقة مرة واحدة
 async function setGroupStatus(gi, patch) {
   const g = S._groups && S._groups[gi];
   if (!g) return;
+  // نسجل الموظف تلقائيًا من قايمة "مين معانا؟" لو مختارش اسمه في الكارت،
+  // عشان السجل ما يبقاش فيه تواصل بدون صاحبه.
+  const who = g.who || S.me || '';
+  if (who) { patch = { ...patch, contactedBy: who, assignedTo: who }; }
   for (const m of g.meds) Object.assign(m, patch);
   render();
   try {
@@ -674,30 +825,134 @@ async function setGroupStatus(gi, patch) {
   } catch (e) { alert('لم يُحفظ التغيير: ' + (e.message || e)); loadAll(); }
 }
 
-function openWhatsApp(gi) {
-  const g = S._groups && S._groups[gi];
-  if (!g) return;
-  let list = g.meds.map(m => '• ' + m.itemName).join('\n');
-  if (g.soon.length)
-    list += '\n\nوقرب يخلص كمان:\n' + g.soon.map(m => '• ' + m.itemName).join('\n');
-  // الأسماء جاية من نظام الكاشير وفيها رموز إدخال (* . d D ~ وأرقام في الآخر).
-  // نشيلها من الرسالة بس — الاسم في الشيت بيفضل زي ما هو للمطابقة.
-  const cleanName = g.name
-    .replace(/[*~.]/g, ' ')
-    .replace(/\b[dD]\b/g, ' ')
-    .replace(/\d+\s*$/, '')
-    .replace(/\s+/g, ' ')
-    .trim();
-  // لو كل الأصناف مستلزمات (لبن/حفاضات) نستخدم النص التاني
-  const all = [...g.meds, ...g.soon];
-  const allConsumable = all.length > 0 &&
-    all.every(m => CONSUMABLE_CATS.includes(m.category));
-  const msg = (allConsumable ? getMsg2() : getMsg())
-    .replaceAll('{اسم_العميل}', cleanName || g.name)
-    .replaceAll('{الأدوية}', list)
-    .replaceAll('{اسم_الدواء}', list);   // توافق مع النص القديم
-  window.open(`https://wa.me/2${g.phone}?text=${encodeURIComponent(msg)}`, '_blank');
-  setGroupStatus(gi, { status: 'contacted', lastContactedAt: new Date().toISOString() });
+// ---------- شاشة: التجميل ----------
+// منتجات العناية فوق الحد السعري، على مرحلتين: استطلاع رأي ثم إعادة شراء.
+function viewCosmetics() {
+  const t = todayStr();
+  const stage = S.cosStage || 'cos_sat';
+  let list = S.followups.filter(f => f.kind === stage &&
+    f.dueDate <= t && f.status === 'pending' && !f.optedOut && f.phoneValid);
+
+  if (S.filterStaff === '__me__' && S.me) list = list.filter(f => !f.assignedTo || f.assignedTo === S.me);
+  list.sort((a, b) => a.dueDate.localeCompare(b.dueDate));
+  S._cosList = list;
+
+  const nSat = S.followups.filter(f => f.kind === 'cos_sat' && f.dueDate <= t
+    && f.status === 'pending' && !f.optedOut && f.phoneValid).length;
+  const nRep = S.followups.filter(f => f.kind === 'cos_rep' && f.dueDate <= t
+    && f.status === 'pending' && !f.optedOut && f.phoneValid).length;
+
+  let h = `<div class="buckets">
+    <button class="bk ${stage==='cos_sat'?'on':''}" data-cs="cos_sat">استطلاع رأي <b>${nSat}</b></button>
+    <button class="bk ${stage==='cos_rep'?'on':''}" data-cs="cos_rep">إعادة شراء <b>${nRep}</b></button>
+  </div>`;
+
+  h += `<div class="warn">${stage==='cos_sat'
+    ? 'دي مكالمة رضا بعد الشراء بأيام — الهدف تسمع رأيه وترشّح بديل لو مش مناسب، مش تبيعه حاجة.'
+    : 'دي مكالمة تذكير — المنتج غالبًا قرب يخلص. المدة تقديرية (' + REPURCHASE_DAYS + ' يوم) وتقدر تعدّلها.'}</div>`;
+
+  if (!list.length) {
+    h += `<div class="empty"><div class="ic">✨</div><p>مفيش حالات في القسم ده.</p></div>`;
+    return h;
+  }
+
+  list.forEach((f, i) => {
+    const l = daysBetween(f.dueDate, t);
+    h += `<div class="row ${l > 14 ? 'late' : 'due'}">
+      <div class="nm">${esc(f.customerName)}
+        <span class="tag">${l > 0 ? 'من ' + l + ' يوم' : 'النهاردة'}</span></div>
+      <div class="meta phoneline">
+        <span class="ph">${esc(f.customerPhone)}</span>
+        <button class="cp" data-cpph="${esc(f.customerPhone)}">نسخ الرقم</button>
+        ${f.assignedTo ? '<span>• ' + esc(f.assignedTo) + '</span>' : ''}
+      </div>
+      <div class="med">💄 ${esc(f.itemName)}
+        <span class="meta">— ${f.price ? f.price + ' ج • ' : ''}اشتراه ${esc(f.lastPurchaseDate)}</span></div>
+      <div class="msgbox">
+        <div class="msghd"><span>الرسالة الجاهزة</span>
+          <button class="cp" data-cpcos="${i}">نسخ الرسالة</button></div>
+        <div class="msgtx">${esc(buildMessage(f.customerName, [f], [], f.kind))}</div>
+      </div>
+      <div class="acts">
+        <button class="b wa" data-cdone="${i}">تم التواصل</button>
+        <button class="b ok" data-cbuy="${i}">اشترى</button>
+        <button class="b no" data-cno="${i}">مردش</button>
+      </div>
+      <button class="lnk" data-cout="${i}">إيقاف المتابعة</button>
+    </div>`;
+  });
+  return h;
+}
+
+async function setCosStatus(i, patch) {
+  const f = S._cosList && S._cosList[i];
+  if (!f) return;
+  const who = f.assignedTo || S.me || '';
+  if (who) patch = { ...patch, contactedBy: who, assignedTo: who };
+  Object.assign(f, patch);
+  render();
+  try { await storePatch('followups', f._id, patch); }
+  catch (e) { alert('لم يُحفظ: ' + (e.message || e)); loadAll(); }
+}
+
+// ---------- شاشة: سجل التواصل ----------
+function viewLog() {
+  const done = S.followups.filter(f => f.lastContactedAt)
+    .sort((a, b) => (b.lastContactedAt || '').localeCompare(a.lastContactedAt || ''));
+
+  const staffNames = [...new Set(done.map(f => f.contactedBy || f.assignedTo).filter(Boolean))].sort();
+  let list = done;
+  if (S.logStaff && S.logStaff !== '__all__')
+    list = list.filter(f => (f.contactedBy || f.assignedTo) === S.logStaff);
+
+  const label = st => st === 'returned' ? 'اشترى'
+    : st === 'no_answer' ? 'مردش' : 'تم التواصل';
+  const cls = st => st === 'returned' ? 'ok' : st === 'no_answer' ? 'r' : '';
+
+  const byStaff = {};
+  for (const f of done) {
+    const w = f.contactedBy || f.assignedTo || '(غير محدد)';
+    byStaff[w] = byStaff[w] || { all: 0, ret: 0 };
+    byStaff[w].all++;
+    if (f.status === 'returned') byStaff[w].ret++;
+  }
+
+  let h = `<div class="stat">
+    <div><b>${done.length}</b><span>إجمالي تواصل</span></div>
+    <div><b>${done.filter(f => f.status === 'returned').length}</b><span>اشتروا بعده</span></div>
+    <div><b>${done.filter(f => f.status === 'no_answer').length}</b><span>مردوش</span></div>
+  </div>`;
+
+  if (Object.keys(byStaff).length) {
+    h += `<div class="card"><h2>حسب الموظف</h2>
+      <table><thead><tr><th>الموظف</th><th>تواصل</th><th>اشتروا</th><th>النسبة</th></tr></thead><tbody>
+      ${Object.entries(byStaff).sort((a,b)=>b[1].all-a[1].all).map(([w, v]) =>
+        `<tr><td>${esc(w)}</td><td>${v.all}</td><td>${v.ret}</td>
+         <td>${v.all ? Math.round(100*v.ret/v.all) : 0}%</td></tr>`).join('')}
+      </tbody></table></div>`;
+  }
+
+  h += `<div class="fl"><select id="lgs">
+      <option value="__all__">كل الموظفين</option>
+      ${staffNames.map(n => `<option value="${esc(n)}" ${S.logStaff===n?'selected':''}>${esc(n)}</option>`).join('')}
+    </select></div>`;
+
+  if (!list.length) {
+    h += `<div class="empty"><div class="ic">📞</div><p>مفيش تواصل مسجل لسه.</p></div>`;
+    return h;
+  }
+
+  list.slice(0, 200).forEach(f => {
+    h += `<div class="row">
+      <div class="nm">${esc(f.customerName)}
+        <span class="tag ${cls(f.status)}">${label(f.status)}</span></div>
+      <div class="meta">${esc(f.itemName)}</div>
+      <div class="meta">${esc((f.lastContactedAt || '').slice(0, 16).replace('T', ' '))}
+        • ${esc(f.contactedBy || f.assignedTo || 'غير محدد')}</div>
+    </div>`;
+  });
+  if (list.length > 200) h += `<p class="meta">أحدث 200 من ${list.length}.</p>`;
+  return h;
 }
 
 // ---------- شاشة: بحث بالصنف ----------
@@ -774,23 +1029,18 @@ function viewSearch() {
       <div class="meta">${f.phoneValid ? esc(f.customerPhone) : 'مفيش رقم صالح'}
         • آخر صرف ${esc(f.lastPurchaseDate)} • كل ${f.cycleDays} يوم</div>
       ${f.phoneValid ? `<div class="acts">
-        <button class="b wa" data-dwa="${i}">واتساب</button></div>` : ''}
+        <button class="b wa" data-dcp="${i}">نسخ الرسالة</button>
+        <button class="b no" data-dph="${esc(f.customerPhone)}">نسخ الرقم</button></div>` : ''}
     </div>`;
   });
   return h;
 }
 
 // رسالة لصنف واحد بعينه (مش كل أدوية العميل)
-function drugWhatsApp(i) {
+function drugMessage(i) {
   const f = S._drugList && S._drugList[i];
-  if (!f) return;
-  const cleanName = f.customerName.replace(/[*~.]/g, ' ').replace(/\b[dD]\b/g, ' ')
-    .replace(/\d+\s*$/, '').replace(/\s+/g, ' ').trim();
-  const tpl = CONSUMABLE_CATS.includes(f.category) ? getMsg2() : getMsg();
-  const msg = tpl.replaceAll('{اسم_العميل}', cleanName || f.customerName)
-                 .replaceAll('{الأدوية}', '• ' + f.itemName)
-                 .replaceAll('{اسم_الدواء}', f.itemName);
-  window.open(`https://wa.me/2${f.customerPhone}?text=${encodeURIComponent(msg)}`, '_blank');
+  if (!f) return '';
+  return buildMessage(f.customerName, [f], [], f.kind || 'chronic');
 }
 
 // ---------- شاشة 2: رفع البيانات ----------
@@ -902,6 +1152,16 @@ function viewItems() {
     عشان كلمة "دواك" و"الجرعة" مش مناسبة ليها.</p>
     <textarea id="msgT2">${esc(getMsg2())}</textarea>
     <button class="big" id="bMsg2">حفظ نص المستلزمات</button>
+
+    <h2 style="margin-top:18px">نص استطلاع رأي التجميل</h2>
+    <p class="meta">بيتبعت بعد ${SATISFACTION_DAYS} أيام من شراء منتج عناية فوق ${COSMETIC_MIN_PRICE} ج.</p>
+    <textarea id="msgT3">${esc(getMsg3())}</textarea>
+    <button class="big" id="bMsg3">حفظ نص الاستطلاع</button>
+
+    <h2 style="margin-top:18px">نص إعادة شراء التجميل</h2>
+    <p class="meta">بيتبعت بعد ${REPURCHASE_DAYS} يوم من الشراء.</p>
+    <textarea id="msgT4">${esc(getMsg4())}</textarea>
+    <button class="big" id="bMsg4">حفظ نص إعادة الشراء</button>
   </div>
 
   <div class="card">
@@ -923,10 +1183,13 @@ async function saveItem(name, patch) {
 //  الرسم والأحداث
 // ============================================================================
 function render() {
-  const tabs = [['today','النهاردة'],['search','بحث بالصنف'],['upload','رفع البيانات'],['items','الأصناف']];
+  const tabs = [['today','النهاردة'],['cos','التجميل'],['log','سجل التواصل'],
+                ['search','بحث بالصنف'],['upload','رفع البيانات'],['items','الأصناف']];
   let body;
   if (S.loading)   body = `<div class="empty"><div class="ic">⏳</div><p>جاري التحميل...</p></div>`;
   else if (S.tab === 'today')  body = viewToday();
+  else if (S.tab === 'cos')    body = viewCosmetics();
+  else if (S.tab === 'log')    body = viewLog();
   else if (S.tab === 'search') body = viewSearch();
   else if (S.tab === 'upload') body = viewUpload();
   else                          body = viewItems();
@@ -963,7 +1226,34 @@ function wire() {
   });
 
   // --- النهاردة ---
-  on('[data-wa]',  'click', e => openWhatsApp(+e.currentTarget.dataset.wa));
+  on('[data-done]', 'click', e => setGroupStatus(+e.currentTarget.dataset.done,
+      { status:'contacted', lastContactedAt:new Date().toISOString() }));
+  on('[data-cpmsg]', 'click', e => {
+    const g = S._groups[+e.currentTarget.dataset.cpmsg];
+    copyText(buildMessage(g.name, g.meds, g.soon, 'chronic'), e.currentTarget);
+  });
+  on('[data-cpph]', 'click', e => copyText(e.currentTarget.dataset.cpph, e.currentTarget));
+
+  // --- التجميل ---
+  on('[data-cs]', 'click', e => { S.cosStage = e.currentTarget.dataset.cs; render(); });
+  on('[data-cpcos]', 'click', e => {
+    const f = S._cosList[+e.currentTarget.dataset.cpcos];
+    copyText(buildMessage(f.customerName, [f], [], f.kind), e.currentTarget);
+  });
+  on('[data-cdone]', 'click', e => setCosStatus(+e.currentTarget.dataset.cdone,
+      { status:'contacted', lastContactedAt:new Date().toISOString() }));
+  on('[data-cbuy]', 'click', e => setCosStatus(+e.currentTarget.dataset.cbuy,
+      { status:'returned', lastContactedAt:new Date().toISOString() }));
+  on('[data-cno]', 'click', e => setCosStatus(+e.currentTarget.dataset.cno,
+      { status:'no_answer', lastContactedAt:new Date().toISOString() }));
+  on('[data-cout]', 'click', e => {
+    if (confirm('هيتوقف إرسال أي تذكير للعميل ده عن المنتج ده. تمام؟'))
+      setCosStatus(+e.currentTarget.dataset.cout, { optedOut:true });
+  });
+
+  // --- سجل التواصل ---
+  const lgs = document.getElementById('lgs');
+  if (lgs) lgs.addEventListener('change', e => { S.logStaff = e.target.value; render(); });
   on('[data-ret]', 'click', e => setGroupStatus(+e.currentTarget.dataset.ret,
       { status:'returned', lastContactedAt:new Date().toISOString() }));
   on('[data-na]',  'click', e => setGroupStatus(+e.currentTarget.dataset.na,
@@ -989,7 +1279,8 @@ function wire() {
   on('[data-dp]', 'click', e => { S.drugPick = e.currentTarget.dataset.dp; render(); });
   const dsc = document.getElementById('dscope');
   if (dsc) dsc.addEventListener('change', e => { S.drugScope = e.target.value; render(); });
-  on('[data-dwa]', 'click', e => drugWhatsApp(+e.currentTarget.dataset.dwa));
+  on('[data-dcp]', 'click', e => copyText(drugMessage(+e.currentTarget.dataset.dcp), e.currentTarget));
+  on('[data-dph]', 'click', e => copyText(e.currentTarget.dataset.dph, e.currentTarget));
 
   // --- الأصناف ---
   const ifil = document.getElementById('ifil');
@@ -1032,8 +1323,15 @@ function wire() {
   });
   const bMsg2 = document.getElementById('bMsg2');
   if (bMsg2) bMsg2.addEventListener('click', () => {
-    saveMsg2(document.getElementById('msgT2').value);
-    alert('اتحفظ.');
+    saveMsg2(document.getElementById('msgT2').value); alert('اتحفظ.');
+  });
+  const bMsg3 = document.getElementById('bMsg3');
+  if (bMsg3) bMsg3.addEventListener('click', () => {
+    saveMsg3(document.getElementById('msgT3').value); alert('اتحفظ.');
+  });
+  const bMsg4 = document.getElementById('bMsg4');
+  if (bMsg4) bMsg4.addEventListener('click', () => {
+    saveMsg4(document.getElementById('msgT4').value); alert('اتحفظ.');
   });
   const bReset = document.getElementById('bReset');
   if (bReset) bReset.addEventListener('click', async () => {
@@ -1090,7 +1388,7 @@ function wire() {
       await loadAll();
       document.getElementById('pSales').innerHTML = `<div class="good">تم.
 • ${r.customers} عميل
-• ${r.saved} متابعة اتسجلت
+• ${r.saved} متابعة اتسجلت (منها ${r.cosCount} تجميل)
 • ${r.newItems} صنف جديد محتاج مراجعة
 • ${r.noPhone} متابعة من غير رقم صالح (مش هتظهر في القايمة)
 • ${r.skippedGeneric} سطر اتستبعد (أسماء عامة زي "عميل زائر")</div>`;
