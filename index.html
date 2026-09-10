@@ -225,6 +225,7 @@ const COSMETIC_MIN_PRICE = 200;
 const SATISFACTION_DAYS = 6;    // استطلاع الرأي بعد أسبوع تقريبًا
 const REPURCHASE_DAYS  = 45;    // تقدير عام لمنتجات العناية
 const SAT_WINDOW_DAYS  = 60;    // استطلاع الرأي يفضل منطقي لحد شهرين من الشراء
+const LAPSED_DAYS      = 90;    // عميل تجميل مشتراش من المدة دي = عميل بيتفقد
 const CONSUMABLE_CATS = ['ألبان أطفال', 'حفاضات أطفال', 'حفاضات كبار'];
 
 let db = null, app = null;
@@ -835,12 +836,20 @@ function viewCosmetics() {
   // عمر الشراء نفسه — مش تاريخ الاستحقاق
   const ageOf = f => daysBetween(f.lastPurchaseDate, t);
 
+  // مهم: الشراء الواحد بيولّد صفّين (استطلاع + إعادة شراء).
+  // لو سبناهم كده، الشراء اللي عمره بين REPURCHASE_DAYS و SAT_WINDOW_DAYS
+  // كان هيظهر في القسمين، والموظف يكلم العميل مرتين عن نفس المنتج.
+  // الحل: أول ما يحين وقت إعادة الشراء، الاستطلاع بيبقى فات أوانه ويتشال منه.
+  // مهم: الشراء الواحد بيولّد صفّين (استطلاع + إعادة شراء).
+  // لو سبناهم كده، الشراء اللي عمره بين REPURCHASE_DAYS و SAT_WINDOW_DAYS
+  // كان هيظهر في القسمين، والموظف يكلم العميل مرتين عن نفس المنتج.
   const inStage = f => {
     if (!ready(f)) return false;
-    if (stage === 'cos_sat') return f.kind === 'cos_sat' && ageOf(f) <= SAT_WINDOW_DAYS;
-    if (stage === 'cos_rep') return f.kind === 'cos_rep';
-    // قديم: استطلاع فات عليه أكتر من الحد
-    return f.kind === 'cos_sat' && ageOf(f) > SAT_WINDOW_DAYS;
+    const a = ageOf(f);
+    if (stage === 'cos_sat') return f.kind === 'cos_sat' && a < REPURCHASE_DAYS;
+    if (stage === 'cos_rep') return f.kind === 'cos_rep' && a <= LAPSED_DAYS;
+    // بعُدوا: مشتروش من أكتر من LAPSED_DAYS — دول عملاء بنخسرهم فعليًا
+    return f.kind === 'cos_rep' && a > LAPSED_DAYS;
   };
 
   let list = S.followups.filter(inStage);
@@ -848,20 +857,20 @@ function viewCosmetics() {
   list.sort((a, b) => a.dueDate.localeCompare(b.dueDate));
   S._cosList = list;
 
-  const nSat = S.followups.filter(f => ready(f) && f.kind === 'cos_sat' && ageOf(f) <= SAT_WINDOW_DAYS).length;
-  const nRep = S.followups.filter(f => ready(f) && f.kind === 'cos_rep').length;
-  const nOld = S.followups.filter(f => ready(f) && f.kind === 'cos_sat' && ageOf(f) > SAT_WINDOW_DAYS).length;
+  const nSat = S.followups.filter(f => ready(f) && f.kind === 'cos_sat' && ageOf(f) < REPURCHASE_DAYS).length;
+  const nRep = S.followups.filter(f => ready(f) && f.kind === 'cos_rep' && ageOf(f) <= LAPSED_DAYS).length;
+  const nOld = S.followups.filter(f => ready(f) && f.kind === 'cos_rep' && ageOf(f) > LAPSED_DAYS).length;
 
   let h = `<div class="buckets">
     <button class="bk ${stage==='cos_sat'?'on':''}" data-cs="cos_sat">استطلاع رأي <b>${nSat}</b></button>
     <button class="bk ${stage==='cos_rep'?'on':''}" data-cs="cos_rep">إعادة شراء <b>${nRep}</b></button>
-    <button class="bk cold ${stage==='cos_old'?'on':''}" data-cs="cos_old">قديم <b>${nOld}</b></button>
+    <button class="bk cold ${stage==='cos_old'?'on':''}" data-cs="cos_old">بعُدوا عننا <b>${nOld}</b></button>
   </div>`;
 
   h += `<div class="warn">${
-      stage==='cos_sat' ? 'مكالمة رضا بعد الشراء بأيام — الهدف تسمع رأيه وترشّح بديل لو مش مناسب، مش تبيعه حاجة. القسم ده بيعرض المشتريات آخر ' + SAT_WINDOW_DAYS + ' يوم بس.'
+      stage==='cos_sat' ? 'مكالمة رضا بعد الشراء بأيام — الهدف تسمع رأيه وترشّح بديل لو مش مناسب، مش تبيعه حاجة. بيعرض المشتريات أقل من ' + REPURCHASE_DAYS + ' يوم، وبعد كده بينتقل لإعادة الشراء عشان محدش يتكلم مرتين.'
     : stage==='cos_rep' ? 'مكالمة تذكير — المنتج غالبًا قرب يخلص. المدة تقديرية (' + REPURCHASE_DAYS + ' يوم).'
-    : 'مشتريات فات عليها أكتر من ' + SAT_WINDOW_DAYS + ' يوم. سؤال "إيه رأيك" هنا متأخر — لو هتكلمهم، اسأل لو محتاج يجدّد بدل ما تسأل عن رأيه.'}</div>`;
+    : 'عملاء مشتروش منتج العناية ده من أكتر من ' + LAPSED_DAYS + ' يوم — دول بنخسرهم فعليًا، غالبًا بيشتروا من مكان تاني أو وقفوا. حملة استرجاع أو عرض خاص أنسب من تذكير عادي.'}</div>`;
 
   if (!list.length) {
     h += `<div class="empty"><div class="ic">✨</div><p>مفيش حالات في القسم ده.</p></div>`;
