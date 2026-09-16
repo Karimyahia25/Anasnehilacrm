@@ -47,6 +47,10 @@
   .cp{border:1px solid var(--g);background:#fff;color:var(--g);border-radius:7px;
     padding:4px 10px;font-size:12px;font-weight:700;cursor:pointer;font-family:inherit}
   .cp.done{background:var(--g);color:#fff}
+  .items{margin-top:8px;font-size:13px}
+  .items summary{cursor:pointer;color:var(--g2);font-weight:600}
+  .itemstx{padding:8px;background:#f7f9fa;border-radius:8px;margin-top:6px;
+    color:var(--mut);max-height:120px;overflow:auto;line-height:1.7}
   .phoneline{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
   .ph{direction:ltr;font-weight:700;color:var(--tx)}
   .buckets{display:flex;gap:7px;overflow-x:auto;padding-bottom:6px;margin-bottom:12px}
@@ -203,6 +207,14 @@ const DEFAULT_MSG2 =
 const MSG2_KEY = 'pharma_msg2_v1';
 const MSG3_KEY = 'pharma_msg3_v1';   // استطلاع رأي بعد شراء منتج تجميل
 const MSG4_KEY = 'pharma_msg4_v1';   // تذكير بإعادة شراء منتج تجميل
+const MSG5_KEY = 'pharma_msg5_v1';   // استرجاع عميل بعُد
+
+const DEFAULT_MSG5 =
+  'أهلاً {اسم_العميل} 🌿\n'
++ 'معاك صيدلية أنس نحيلة.\n\n'
++ 'وحشتنا والله 💚 بنطمن على حضرتك، كل حاجة تمام؟\n\n'
++ 'لو محتاج أي حاجة من اللي كنت بتاخدها، أو محتاج استشارة، إحنا موجودين زي ما إحنا.\n'
++ 'وبنوصّل للبيت كمان لو حابب.';
 
 const DEFAULT_MSG3 =
   'أهلاً {اسم_العميل} 🌿\n'
@@ -225,6 +237,7 @@ const COSMETIC_MIN_PRICE = 200;
 const SATISFACTION_DAYS = 6;    // استطلاع الرأي بعد أسبوع تقريبًا
 const REPURCHASE_DAYS  = 45;    // تقدير عام لمنتجات العناية
 const SAT_WINDOW_DAYS  = 60;    // استطلاع الرأي يفضل منطقي لحد شهرين من الشراء
+const LAPSED_DAYS      = 90;    // عميل تجميل مشتراش من المدة دي = عميل بيتفقد
 const CONSUMABLE_CATS = ['ألبان أطفال', 'حفاضات أطفال', 'حفاضات كبار'];
 
 let db = null, app = null;
@@ -232,6 +245,7 @@ let S = {
   tab: 'today',
   me: LS.get(ME_KEY) || '',
   items: [],       // {itemName,isChronic,category,cycleDays}
+  lapsed: [],      // عملاء اشتروا سنة فاتت ووقفوا
   followups: [],   // صفوف المتابعة
   staff: [],       // {name,active}
   loading: true,
@@ -244,7 +258,10 @@ let S = {
   drugPick: '',
   drugScope: 'all',
   cosStage: 'cos_sat',
-  logStaff: '__all__'
+  logStaff: '__all__',
+  lapsed: [],
+  lapSort: 'spend',
+  lapShow: 'pending'
 };
 
 const el = document.getElementById('app');
@@ -307,10 +324,12 @@ function getMsg3()  { return LS.get(MSG3_KEY) || DEFAULT_MSG3; }
 function saveMsg3(v){ LS.set(MSG3_KEY, v); }
 function getMsg4()  { return LS.get(MSG4_KEY) || DEFAULT_MSG4; }
 function saveMsg4(v){ LS.set(MSG4_KEY, v); }
+function getMsg5()  { return LS.get(MSG5_KEY) || DEFAULT_MSG5; }
+function saveMsg5(v){ LS.set(MSG5_KEY, v); }
 
 // ============================ طبقة التخزين: Firestore ============================
 // نفس أسماء الدوال المستخدمة في النسخة المحلية، فباقي التطبيق ما اتغيرش.
-const COLS = ['items', 'followups', 'staff'];
+const COLS = ['items', 'followups', 'staff', 'lapsed'];
 const cleanId = s => String(s).replace(/[\/\\.#$\[\]]/g, '_').slice(0, 480) || '_';
 
 async function connect(cfg) {
@@ -344,8 +363,8 @@ async function storePatch(name, id, patch) {
 async function loadAll() {
   S.loading = true; render();
   try {
-    const [it, fu, st] = await Promise.all(COLS.map(storeAll));
-    S.items = it; S.followups = fu; S.staff = st; S.err = '';
+    const [it, fu, st, lp] = await Promise.all(COLS.map(storeAll));
+    S.items = it; S.followups = fu; S.staff = st; S.lapsed = lp; S.err = '';
   } catch (e) {
     S.err = 'تعذّر تحميل البيانات من Firebase:\n' + (e.message || e) +
       '\n\nلو الرسالة فيها permission، افتح Firestore > Rules واسمح بالقراءة والكتابة.';
@@ -429,6 +448,53 @@ async function writeChunks(col, rows, idFn, setProg, from, to) {
   }
 }
 
+// --- رفع ملف "عملاء بعُدوا" (الملف اللي بيتولد من بيانات السنة اللي فاتت) ---
+async function uploadLapsed(file, setProg) {
+  const X = await ensureXlsx();
+  setProg(10, 'جاري قراءة الملف...');
+  const wb = X.read(new Uint8Array(await file.arrayBuffer()), { type: 'array', cellDates: true });
+  // ناخد شيت الملخص (صف لكل عميل)
+  let rows = null;
+  for (const sn of wb.SheetNames) {
+    const r = X.utils.sheet_to_json(wb.Sheets[sn], { defval: '' });
+    if (!r.length) continue;
+    const keys = Object.keys(r[0]).map(k => String(k).trim());
+    if (keys.some(k => k === 'اسم العميل') && keys.some(k => k.includes('إجمالي'))) { rows = r; break; }
+  }
+  if (!rows) throw new Error('مش لاقي شيت فيه "اسم العميل" و"إجمالي". استخدم ملف "عملاء ضاعوا".');
+
+  const prev = new Map(S.lapsed.map(x => [x._id, x]));
+  const out = [];
+  for (const r of rows) {
+    const name = String(pick(r, ['اسم العميل']) ?? '').trim();
+    if (!name) continue;
+    const rawPhone = String(pick(r, ['رقم الهاتف']) ?? '').trim();
+    const phone = /^01[0125]\d{8}$/.test(rawPhone) ? rawPhone : '';
+    const id = cleanId(name);
+    const p = prev.get(id);
+    out.push({
+      _id: id,
+      customerName: name,
+      customerPhone: phone,
+      phoneValid: !!phone,
+      spend: parseFloat(pick(r, ['إجمالي 2025 (ج)', 'إجمالي 2025'])) || 0,
+      visits: parseInt(pick(r, ['عدد الزيارات']), 10) || 0,
+      lastPurchaseDate: String(pick(r, ['آخر شراء']) ?? '').slice(0, 10),
+      awayDays: parseInt(pick(r, ['غايب من (يوم)']), 10) || 0,
+      itemsText: String(pick(r, ['كل الأصناف اللي أخدها']) ?? '').trim(),
+      // قرارات الفريق السابقة بتفضل
+      status: p ? (p.status || 'pending') : 'pending',
+      lastContactedAt: p ? (p.lastContactedAt || null) : null,
+      contactedBy: p ? (p.contactedBy || '') : '',
+      optedOut: p ? !!p.optedOut : false
+    });
+  }
+  setProg(50, `جاري حفظ ${out.length} عميل...`);
+  await writeChunks('lapsed', out, r => r._id, setProg, 50, 98);
+  setProg(100, 'تم.');
+  return { count: out.length, withPhone: out.filter(x => x.phoneValid).length };
+}
+
 // --- رفع ملف المبيعات: الخطوة الأساسية ---
 async function uploadSales(file, setProg) {
   const X = await ensureXlsx();
@@ -470,6 +536,7 @@ async function uploadSales(file, setProg) {
   setProg(35, 'جاري حساب مواعيد المتابعة...');
   const pairs = new Map();      // "عميل\u0000صنف" -> {…}  (مزمن)
   const cosPairs = new Map();   // منتجات التجميل فوق الحد السعري
+  const seenCustomers = new Set();
   let skippedGeneric = 0, noPhone = 0, scanned = 0;
 
   for (const r of salesRows) {
@@ -480,6 +547,7 @@ async function uploadSales(file, setProg) {
     scanned++;
 
     if (isGenericName(cust)) { skippedGeneric++; continue; }
+    seenCustomers.add(cust);
 
     let meta = itemMap.get(item);
     if (!meta) {                       // صنف جديد: يُسجَّل غير مزمن حتى يراجعه الصيدلي
@@ -508,22 +576,34 @@ async function uploadSales(file, setProg) {
 
     const key = cust + '\u0000' + item;
     const cur = pairs.get(key);
+    const qty = Math.max(1, parseFloat(pick(r, ['الكمية'])) || 1);
     if (!cur || (dt && dt > cur.lastPurchaseDate)) {
       pairs.set(key, {
         customerName: cust,
         itemName: item,
         category: meta.category || '',
         cycleDays: meta.cycleDays || 30,
-        lastPurchaseDate: dt || (cur ? cur.lastPurchaseDate : todayStr())
+        lastPurchaseDate: dt || (cur ? cur.lastPurchaseDate : todayStr()),
+        lastQty: qty
       });
+    } else if (dt && cur && dt === cur.lastPurchaseDate) {
+      // نفس اليوم = نفس الزيارة، نجمع الكميات
+      cur.lastQty += qty;
     }
   }
 
   // 4) بناء صفوف المتابعة
   const prevById = new Map(S.followups.map(f => [f._id, f]));
+
+  // الرفع اليومي بييجي غالبًا بشيت المبيعات لوحده من غير شيت الأرقام.
+  // من غير الاحتياطي ده، الأرقام المحفوظة كانت هتتمسح والعملاء يختفوا من القايمة.
+  const prevPhone = new Map();
+  for (const f of S.followups)
+    if (f.phoneValid && f.customerPhone && !prevPhone.has(f.customerName))
+      prevPhone.set(f.customerName, f.customerPhone);
   const rows = [];
   for (const p of pairs.values()) {
-    const phone = phoneOf.get(p.customerName) || null;
+    const phone = phoneOf.get(p.customerName) || prevPhone.get(p.customerName) || null;
     if (!phone) noPhone++;
     const id = cleanId(p.customerName + '__' + p.itemName);
     const prev = prevById.get(id);
@@ -535,8 +615,10 @@ async function uploadSales(file, setProg) {
       itemName: p.itemName,
       category: p.category,
       cycleDays: p.cycleDays,
+      lastQty: p.lastQty || 1,
       lastPurchaseDate: p.lastPurchaseDate,
-      dueDate: addDays(p.lastPurchaseDate, p.cycleDays),
+      // العميل اللي أخد علبتين معاه كفاية ضعف المدة — لازم الكمية تتحسب
+      dueDate: addDays(p.lastPurchaseDate, p.cycleDays * (p.lastQty || 1)),
       // نحافظ على قرارات الفريق السابقة ولا نمسحها بالرفع الجديد
       optedOut: prev ? !!prev.optedOut : false,
       status: (prev && prev.lastPurchaseDate === p.lastPurchaseDate) ? prev.status : 'pending',
@@ -550,7 +632,7 @@ async function uploadSales(file, setProg) {
   //     استطلاع رأي بعد أيام قليلة، وتذكير بإعادة الشراء بعد فترة أطول.
   let cosCount = 0;
   for (const c of cosPairs.values()) {
-    const phone = phoneOf.get(c.customerName) || null;
+    const phone = phoneOf.get(c.customerName) || prevPhone.get(c.customerName) || null;
     for (const [kind, days] of [['cos_sat', SATISFACTION_DAYS], ['cos_rep', REPURCHASE_DAYS]]) {
       const id = cleanId(c.customerName + '__' + c.itemName + '__' + kind);
       const prev = prevById.get(id);
@@ -589,9 +671,22 @@ async function uploadSales(file, setProg) {
     r => r.customerName + '__' + r.itemName + (r.kind === 'chronic' ? '' : '__' + r.kind),
     setProg, 72, 98);
 
+  // لو عميل من قايمة "بعُدوا" ظهر في المبيعات، يبقى رجع فعلًا — نشيله من القايمة
+  let revived = 0;
+  if (S.lapsed.length) {
+    const back = S.lapsed.filter(l => l.status !== 'returned' && seenCustomers.has(l.customerName));
+    for (const l of back) {
+      await storePatch('lapsed', l._id,
+        { status: 'returned', returnedOn: todayStr(), autoDetected: true });
+      revived++;
+    }
+  }
+
   setProg(100, 'تم.');
   return {
+    revived,
     scanned, saved: rows.length, newItems: newItems.length, cosCount,
+    hadPhoneSheet: !!phoneRows,
     noPhone, skippedGeneric,
     customers: new Set(rows.map(r => r.customerName)).size
   };
@@ -732,14 +827,16 @@ function viewToday() {
       </div>
       ${g.meds.map(m => {
         const l = daysBetween(m.dueDate, t);
+        const q = m.lastQty > 1 ? ` (${m.lastQty} عبوة)` : '';
         return `<div class="med">💊 ${esc(m.itemName)}
-          <span class="meta">— آخر صرف ${esc(m.lastPurchaseDate)} • ${
+          <span class="meta">— آخر صرف ${esc(m.lastPurchaseDate)}${q} • ${
             l > 0 ? 'متأخر ' + l + ' يوم' : 'مستحق النهاردة'}</span></div>`;
       }).join('')}
       ${g.soon.length ? `<div class="soon">
         <div class="soonh">كمان قرب يخلص — اعرضه في نفس المكالمة</div>
         ${g.soon.map(m => `<div class="med">🔸 ${esc(m.itemName)}
-          <span class="meta">— باقي ${daysBetween(t, m.dueDate)} يوم</span></div>`).join('')}
+          <span class="meta">— باقي ${daysBetween(t, m.dueDate)} يوم${
+            m.lastQty > 1 ? ' • ' + m.lastQty + ' عبوة' : ''}</span></div>`).join('')}
       </div>` : ''}
       <div class="pick">
         <span class="meta">اللي بيتابع:</span>
@@ -788,9 +885,16 @@ async function copyText(txt, btn) {
 
 // اسم العميل بعد تنظيف رموز الإدخال (للعرض في الرسالة فقط)
 function displayName(raw) {
-  const c = String(raw).replace(/[*~.]/g, ' ').replace(/\b[dD]\b/g, ' ')
-    .replace(/\d+\s*$/, '').replace(/\s+/g, ' ').trim();
-  return c || raw;
+  let c = String(raw)
+    .replace(/[*~.]/g, ' ')
+    .replace(/\b[dD]\b/g, ' ')
+    // ملاحظات الكاشير اللي بتتكتب في آخر الاسم (خصم 10، أجل، نقدي...)
+    .replace(/\s*(خصم|أجل|اجل|نقدي|نقدى|مؤجل|فيزا)\s*\d*\s*%?\s*$/g, ' ')
+    .replace(/\d+\s*$/, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  // لو التنظيف أكل الاسم كله، نرجّع الأصلي
+  return c.length >= 2 ? c : String(raw).trim();
 }
 
 // بناء نص الرسالة حسب نوع المتابعة
@@ -835,12 +939,20 @@ function viewCosmetics() {
   // عمر الشراء نفسه — مش تاريخ الاستحقاق
   const ageOf = f => daysBetween(f.lastPurchaseDate, t);
 
+  // مهم: الشراء الواحد بيولّد صفّين (استطلاع + إعادة شراء).
+  // لو سبناهم كده، الشراء اللي عمره بين REPURCHASE_DAYS و SAT_WINDOW_DAYS
+  // كان هيظهر في القسمين، والموظف يكلم العميل مرتين عن نفس المنتج.
+  // الحل: أول ما يحين وقت إعادة الشراء، الاستطلاع بيبقى فات أوانه ويتشال منه.
+  // مهم: الشراء الواحد بيولّد صفّين (استطلاع + إعادة شراء).
+  // لو سبناهم كده، الشراء اللي عمره بين REPURCHASE_DAYS و SAT_WINDOW_DAYS
+  // كان هيظهر في القسمين، والموظف يكلم العميل مرتين عن نفس المنتج.
   const inStage = f => {
     if (!ready(f)) return false;
-    if (stage === 'cos_sat') return f.kind === 'cos_sat' && ageOf(f) <= SAT_WINDOW_DAYS;
-    if (stage === 'cos_rep') return f.kind === 'cos_rep';
-    // قديم: استطلاع فات عليه أكتر من الحد
-    return f.kind === 'cos_sat' && ageOf(f) > SAT_WINDOW_DAYS;
+    const a = ageOf(f);
+    if (stage === 'cos_sat') return f.kind === 'cos_sat' && a < REPURCHASE_DAYS;
+    if (stage === 'cos_rep') return f.kind === 'cos_rep' && a <= LAPSED_DAYS;
+    // بعُدوا: مشتروش من أكتر من LAPSED_DAYS — دول عملاء بنخسرهم فعليًا
+    return f.kind === 'cos_rep' && a > LAPSED_DAYS;
   };
 
   let list = S.followups.filter(inStage);
@@ -848,20 +960,20 @@ function viewCosmetics() {
   list.sort((a, b) => a.dueDate.localeCompare(b.dueDate));
   S._cosList = list;
 
-  const nSat = S.followups.filter(f => ready(f) && f.kind === 'cos_sat' && ageOf(f) <= SAT_WINDOW_DAYS).length;
-  const nRep = S.followups.filter(f => ready(f) && f.kind === 'cos_rep').length;
-  const nOld = S.followups.filter(f => ready(f) && f.kind === 'cos_sat' && ageOf(f) > SAT_WINDOW_DAYS).length;
+  const nSat = S.followups.filter(f => ready(f) && f.kind === 'cos_sat' && ageOf(f) < REPURCHASE_DAYS).length;
+  const nRep = S.followups.filter(f => ready(f) && f.kind === 'cos_rep' && ageOf(f) <= LAPSED_DAYS).length;
+  const nOld = S.followups.filter(f => ready(f) && f.kind === 'cos_rep' && ageOf(f) > LAPSED_DAYS).length;
 
   let h = `<div class="buckets">
     <button class="bk ${stage==='cos_sat'?'on':''}" data-cs="cos_sat">استطلاع رأي <b>${nSat}</b></button>
     <button class="bk ${stage==='cos_rep'?'on':''}" data-cs="cos_rep">إعادة شراء <b>${nRep}</b></button>
-    <button class="bk cold ${stage==='cos_old'?'on':''}" data-cs="cos_old">قديم <b>${nOld}</b></button>
+    <button class="bk cold ${stage==='cos_old'?'on':''}" data-cs="cos_old">بعُدوا عننا <b>${nOld}</b></button>
   </div>`;
 
   h += `<div class="warn">${
-      stage==='cos_sat' ? 'مكالمة رضا بعد الشراء بأيام — الهدف تسمع رأيه وترشّح بديل لو مش مناسب، مش تبيعه حاجة. القسم ده بيعرض المشتريات آخر ' + SAT_WINDOW_DAYS + ' يوم بس.'
+      stage==='cos_sat' ? 'مكالمة رضا بعد الشراء بأيام — الهدف تسمع رأيه وترشّح بديل لو مش مناسب، مش تبيعه حاجة. بيعرض المشتريات أقل من ' + REPURCHASE_DAYS + ' يوم، وبعد كده بينتقل لإعادة الشراء عشان محدش يتكلم مرتين.'
     : stage==='cos_rep' ? 'مكالمة تذكير — المنتج غالبًا قرب يخلص. المدة تقديرية (' + REPURCHASE_DAYS + ' يوم).'
-    : 'مشتريات فات عليها أكتر من ' + SAT_WINDOW_DAYS + ' يوم. سؤال "إيه رأيك" هنا متأخر — لو هتكلمهم، اسأل لو محتاج يجدّد بدل ما تسأل عن رأيه.'}</div>`;
+    : 'عملاء مشتروش منتج العناية ده من أكتر من ' + LAPSED_DAYS + ' يوم — دول بنخسرهم فعليًا، غالبًا بيشتروا من مكان تاني أو وقفوا. حملة استرجاع أو عرض خاص أنسب من تذكير عادي.'}</div>`;
 
   if (!list.length) {
     h += `<div class="empty"><div class="ic">✨</div><p>مفيش حالات في القسم ده.</p></div>`;
@@ -904,6 +1016,103 @@ async function setCosStatus(i, patch) {
   Object.assign(f, patch);
   render();
   try { await storePatch('followups', f._id, patch); }
+  catch (e) { alert('لم يُحفظ: ' + (e.message || e)); loadAll(); }
+}
+
+// ---------- شاشة: عملاء بعُدوا عننا ----------
+// شغل منفصل تمامًا عن المتابعة الدورية — دي حملة استرجاع.
+function viewLapsed() {
+  let list = S.lapsed.filter(x => !x.optedOut);
+  if (S.lapShow === 'pending')  list = list.filter(x => x.status === 'pending' && x.phoneValid);
+  if (S.lapShow === 'done')     list = list.filter(x => x.status && x.status !== 'pending');
+  if (S.lapShow === 'nophone')  list = list.filter(x => !x.phoneValid);
+
+  if (S.lapSort === 'spend') list = [...list].sort((a, b) => (b.spend||0) - (a.spend||0));
+  else                       list = [...list].sort((a, b) => (b.awayDays||0) - (a.awayDays||0));
+
+  const all = S.lapsed.filter(x => !x.optedOut);
+  const back = S.lapsed.filter(x => x.status === 'returned').length;
+  const contacted = S.lapsed.filter(x => x.lastContactedAt).length;
+  const value = all.filter(x => x.status === 'pending').reduce((a, b) => a + (b.spend||0), 0);
+
+  let h = `<div class="stat">
+    <div><b>${all.filter(x => x.status === 'pending').length}</b><span>لسه مرجعوش</span></div>
+    <div><b>${contacted}</b><span>اتكلمنا معاهم</span></div>
+    <div><b>${back}</b><span>رجعوا</span></div>
+    <div><b>${Math.round(value/1000)}k</b><span>قيمتهم السنة اللي فاتت</span></div>
+  </div>`;
+
+  if (!S.lapsed.length) {
+    h += `<div class="empty"><div class="ic">📁</div>
+      <p>مفيش بيانات هنا لسه.</p>
+      <p>روح لتبويب <b>رفع البيانات</b> وارفع ملف "عملاء ضاعوا".</p></div>`;
+    return h;
+  }
+
+  h += `<div class="warn">دول عملاء كانوا بيشتروا السنة اللي فاتت ووقفوا خالص.
+    الهدف مكالمة ودّية تطمن عليهم — مش عرض بيع. ولو حد منهم رجع اشترى، هيتشال من القايمة تلقائيًا مع أول رفع مبيعات.</div>`;
+
+  h += `<div class="fl">
+    <select id="lpShow">
+      <option value="pending" ${S.lapShow==='pending'?'selected':''}>لسه مرجعوش</option>
+      <option value="done"    ${S.lapShow==='done'?'selected':''}>اتعامل معاهم</option>
+      <option value="nophone" ${S.lapShow==='nophone'?'selected':''}>من غير رقم</option>
+      <option value="all"     ${S.lapShow==='all'?'selected':''}>الكل</option>
+    </select>
+    <select id="lpSort">
+      <option value="spend" ${S.lapSort==='spend'?'selected':''}>الأعلى قيمة</option>
+      <option value="away"  ${S.lapSort==='away'?'selected':''}>الأطول غياب</option>
+    </select>
+  </div>`;
+
+  if (!list.length) {
+    h += `<div class="empty"><div class="ic">✅</div><p>مفيش حالات في الفلتر ده.</p></div>`;
+    return h;
+  }
+
+  S._lapList = list;
+  list.slice(0, 120).forEach((x, i) => {
+    const big = (x.spend||0) >= 10000;
+    const st = x.status === 'returned' ? '<span class="tag">رجع ✓</span>'
+      : x.status === 'no_answer' ? '<span class="tag r">مردش</span>'
+      : x.status === 'contacted' ? '<span class="tag">اتكلمنا</span>' : '';
+    h += `<div class="row ${big ? 'late' : ''}">
+      <div class="nm">${esc(x.customerName)}
+        <span class="tag">${(x.spend||0).toLocaleString()} ج</span>${st}</div>
+      <div class="meta phoneline">
+        ${x.phoneValid ? `<span class="ph">${esc(x.customerPhone)}</span>
+          <button class="cp" data-cpph="${esc(x.customerPhone)}">نسخ الرقم</button>`
+          : '<span>مفيش رقم صالح</span>'}
+        <span>• غايب ${x.awayDays} يوم • ${x.visits} زيارة</span>
+      </div>
+      <div class="meta">آخر شراء: ${esc(x.lastPurchaseDate)}</div>
+      ${x.itemsText ? `<details class="items"><summary>الأصناف اللي كان بياخدها</summary>
+        <div class="itemstx">${esc(x.itemsText)}</div></details>` : ''}
+      ${x.phoneValid ? `<div class="msgbox">
+        <div class="msghd"><span>الرسالة الجاهزة</span>
+          <button class="cp" data-cplap="${i}">نسخ الرسالة</button></div>
+        <div class="msgtx">${esc(getMsg5().replaceAll('{اسم_العميل}', displayName(x.customerName)))}</div>
+      </div>
+      <div class="acts">
+        <button class="b wa" data-ldone="${i}">تم التواصل</button>
+        <button class="b ok" data-lback="${i}">رجع</button>
+        <button class="b no" data-lno="${i}">مردش</button>
+      </div>` : ''}
+      <button class="lnk" data-lout="${i}">استبعاد من القايمة</button>
+    </div>`;
+  });
+  if (list.length > 120) h += `<p class="meta">أعلى 120 من ${list.length}.</p>`;
+  return h;
+}
+
+async function setLapStatus(i, patch) {
+  const x = S._lapList && S._lapList[i];
+  if (!x) return;
+  const who = S.me || '';
+  if (who) patch = { ...patch, contactedBy: who };
+  Object.assign(x, patch);
+  render();
+  try { await storePatch('lapsed', x._id, patch); }
   catch (e) { alert('لم يُحفظ: ' + (e.message || e)); loadAll(); }
 }
 
@@ -1039,7 +1248,8 @@ function viewSearch() {
       <div class="nm">${esc(f.customerName)}${tag}</div>
       <div class="med">💊 ${esc(f.itemName)}</div>
       <div class="meta">${f.phoneValid ? esc(f.customerPhone) : 'مفيش رقم صالح'}
-        • آخر صرف ${esc(f.lastPurchaseDate)} • كل ${f.cycleDays} يوم</div>
+        • آخر صرف ${esc(f.lastPurchaseDate)}${f.lastQty > 1 ? ' (' + f.lastQty + ' عبوة)' : ''}
+        • كل ${f.cycleDays} يوم</div>
       ${f.phoneValid ? `<div class="acts">
         <button class="b wa" data-dcp="${i}">نسخ الرسالة</button>
         <button class="b no" data-dph="${esc(f.customerPhone)}">نسخ الرقم</button></div>` : ''}
@@ -1077,6 +1287,13 @@ function viewUpload() {
       الحساب بيتعمل مرة واحدة هنا، عشان كده الشاشات بتفتح فورًا بعد كده.
       قرارات الفريق (رجع / إيقاف المتابعة) بتفضل محفوظة ومش بتتمسح مع الرفع الجديد.
     </p>
+  </div>
+  <div class="card">
+    <h2>3 · ملف "عملاء بعُدوا عننا"</h2>
+    <p>ملف اختياري بيتولد من مبيعات سنة سابقة — بيروح لتبويب منفصل ومش بيأثر على المتابعة العادية.</p>
+    <input type="file" id="fLap" accept=".xlsx,.xls">
+    <button class="big" id="bLap">رفع ملف العملاء اللي بعدوا</button>
+    <div id="pLap"></div>
   </div>
   <div class="card">
     <h2>الفريق</h2>
@@ -1174,6 +1391,11 @@ function viewItems() {
     <p class="meta">بيتبعت بعد ${REPURCHASE_DAYS} يوم من الشراء.</p>
     <textarea id="msgT4">${esc(getMsg4())}</textarea>
     <button class="big" id="bMsg4">حفظ نص إعادة الشراء</button>
+
+    <h2 style="margin-top:18px">نص استرجاع العملاء اللي بعدوا</h2>
+    <p class="meta">بيتبعت لعملاء تبويب "بعُدوا عننا".</p>
+    <textarea id="msgT5">${esc(getMsg5())}</textarea>
+    <button class="big" id="bMsg5">حفظ نص الاسترجاع</button>
   </div>
 
   <div class="card">
@@ -1195,12 +1417,13 @@ async function saveItem(name, patch) {
 //  الرسم والأحداث
 // ============================================================================
 function render() {
-  const tabs = [['today','النهاردة'],['cos','التجميل'],['log','سجل التواصل'],
+  const tabs = [['today','النهاردة'],['cos','التجميل'],['lapsed','بعُدوا عننا'],['log','سجل التواصل'],
                 ['search','بحث بالصنف'],['upload','رفع البيانات'],['items','الأصناف']];
   let body;
   if (S.loading)   body = `<div class="empty"><div class="ic">⏳</div><p>جاري التحميل...</p></div>`;
   else if (S.tab === 'today')  body = viewToday();
   else if (S.tab === 'cos')    body = viewCosmetics();
+  else if (S.tab === 'lapsed') body = viewLapsed();
   else if (S.tab === 'log')    body = viewLog();
   else if (S.tab === 'search') body = viewSearch();
   else if (S.tab === 'upload') body = viewUpload();
@@ -1261,6 +1484,26 @@ function wire() {
   on('[data-cout]', 'click', e => {
     if (confirm('هيتوقف إرسال أي تذكير للعميل ده عن المنتج ده. تمام؟'))
       setCosStatus(+e.currentTarget.dataset.cout, { optedOut:true });
+  });
+
+  // --- عملاء بعُدوا ---
+  const lpS = document.getElementById('lpShow');
+  if (lpS) lpS.addEventListener('change', e => { S.lapShow = e.target.value; render(); });
+  const lpO = document.getElementById('lpSort');
+  if (lpO) lpO.addEventListener('change', e => { S.lapSort = e.target.value; render(); });
+  on('[data-cplap]', 'click', e => {
+    const x = S._lapList[+e.currentTarget.dataset.cplap];
+    copyText(getMsg5().replaceAll('{اسم_العميل}', displayName(x.customerName)), e.currentTarget);
+  });
+  on('[data-ldone]', 'click', e => setLapStatus(+e.currentTarget.dataset.ldone,
+      { status:'contacted', lastContactedAt:new Date().toISOString() }));
+  on('[data-lback]', 'click', e => setLapStatus(+e.currentTarget.dataset.lback,
+      { status:'returned', lastContactedAt:new Date().toISOString() }));
+  on('[data-lno]', 'click', e => setLapStatus(+e.currentTarget.dataset.lno,
+      { status:'no_answer', lastContactedAt:new Date().toISOString() }));
+  on('[data-lout]', 'click', e => {
+    if (confirm('هيتشال من قايمة الاسترجاع نهائيًا. تمام؟'))
+      setLapStatus(+e.currentTarget.dataset.lout, { optedOut:true });
   });
 
   // --- سجل التواصل ---
@@ -1345,6 +1588,10 @@ function wire() {
   if (bMsg4) bMsg4.addEventListener('click', () => {
     saveMsg4(document.getElementById('msgT4').value); alert('اتحفظ.');
   });
+  const bMsg5 = document.getElementById('bMsg5');
+  if (bMsg5) bMsg5.addEventListener('click', () => {
+    saveMsg5(document.getElementById('msgT5').value); alert('اتحفظ.');
+  });
   const bReset = document.getElementById('bReset');
   if (bReset) bReset.addEventListener('click', async () => {
     if (!confirm('⚠️ ده هيمسح البيانات من السحابة، يعني هتتمسح عند كل الفريق. متأكد؟')) return;
@@ -1403,11 +1650,29 @@ function wire() {
 • ${r.saved} متابعة اتسجلت (منها ${r.cosCount} تجميل)
 • ${r.newItems} صنف جديد محتاج مراجعة
 • ${r.noPhone} متابعة من غير رقم صالح (مش هتظهر في القايمة)
-• ${r.skippedGeneric} سطر اتستبعد (أسماء عامة زي "عميل زائر")</div>`;
+• ${r.skippedGeneric} سطر اتستبعد (أسماء عامة زي "عميل زائر")
+${r.revived ? '\n✅ ' + r.revived + ' عميل من قايمة "بعُدوا عننا" رجعوا اشتروا — اتشالوا من القايمة تلقائيًا.' : ''}${r.hadPhoneSheet ? '' : '\n⚠ الملف ده مفيهوش شيت أرقام — استخدمنا الأرقام المحفوظة من قبل. العملاء الجدد اللي ظهروا لأول مرة هيبقوا من غير رقم لحد ما ترفع ملف فيه الأرقام.'}</div>`;
     } catch (e) {
       document.getElementById('pSales').innerHTML = `<div class="err">${esc(e.message || e)}</div>`;
     }
     bSales.disabled = false;
+  });
+
+  const bLap = document.getElementById('bLap');
+  if (bLap) bLap.addEventListener('click', async () => {
+    const f = document.getElementById('fLap').files[0];
+    if (!f) return alert('اختار الملف الأول.');
+    bLap.disabled = true;
+    const p = progressBox('pLap');
+    try {
+      const r = await uploadLapsed(f, p);
+      await loadAll();
+      document.getElementById('pLap').innerHTML =
+        `<div class="good">تم رفع ${r.count} عميل (${r.withPhone} منهم عندهم رقم).</div>`;
+    } catch (e) {
+      document.getElementById('pLap').innerHTML = `<div class="err">${esc(e.message || e)}</div>`;
+    }
+    bLap.disabled = false;
   });
 
   const bAdd = document.getElementById('bAddStaff');
