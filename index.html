@@ -490,6 +490,16 @@ async function uploadItemsTable(file, setProg) {
   }
   setProg(45, `جاري حفظ ${out.length} صنف...`);
   await writeChunks('items', out, r => r.itemName, setProg, 45, 95);
+
+  // الكود بيتربط بصنف واحد بس: لو صف في الملف أخد كود كان على صنف تاني
+  // (الاسم الجديد اللي ظهر بعد تعديل الداتا انتري)، نشيل الكود من التاني.
+  const claimed = new Map(out.filter(r => r.itemCode).map(r => [String(r.itemCode), r.itemName]));
+  const clear = S.items.filter(i => i.itemCode && claimed.has(String(i.itemCode)) &&
+                                    claimed.get(String(i.itemCode)) !== i.itemName);
+  if (clear.length) {
+    setProg(97, `جاري فك الكود من ${clear.length} اسم مكرر...`);
+    await storePut('items', clear.map(i => ({ _id: i.itemName, itemCode: null })));
+  }
   setProg(100, 'تم.');
   return out.length;
 }
@@ -862,8 +872,10 @@ async function uploadSales(file, setProg) {
 // قبل كده كان كل صنف كارت لوحده، فالعميل اللي واخد 5 أدوية كان يظهر 5 مرات.
 function viewToday() {
   const t = todayStr();
+  // صنف اتشال من المزمن = متابعاته القديمة ماتظهرش
+  const notChronic = new Set(S.items.filter(i => !i.isChronic).map(i => i.itemName));
   let due = S.followups.filter(f =>
-    (f.kind || 'chronic') === 'chronic' &&
+    (f.kind || 'chronic') === 'chronic' && !notChronic.has(f.itemName) &&
     f.dueDate <= t && f.status === 'pending' && !f.optedOut && f.phoneValid);
 
   const names = [...new Set(S.followups.map(f => f.assignedTo).filter(Boolean))].sort();
@@ -885,6 +897,7 @@ function viewToday() {
   const soonMap = new Map();
   for (const f of S.followups) {
     if ((f.kind || 'chronic') !== 'chronic') continue;
+    if (notChronic.has(f.itemName)) continue;
     if (f.optedOut || !f.phoneValid) continue;
     if (f.status === 'returned') continue;
     if (!(f.dueDate > t && f.dueDate <= horizon)) continue;
@@ -926,7 +939,7 @@ function viewToday() {
 
   // إجماليات بالعملاء مش بالصفوف
   const allDue = S.followups.filter(f =>
-    (f.kind || 'chronic') === 'chronic' &&
+    (f.kind || 'chronic') === 'chronic' && !notChronic.has(f.itemName) &&
     f.dueDate <= t && f.status === 'pending' && !f.optedOut && f.phoneValid);
   const allCust = new Set(allDue.map(f => f.customerName)).size;
   const doneToday = new Set(S.followups.filter(f =>
