@@ -1022,6 +1022,17 @@ function needStaff(who) {
 async function setGroupStatus(gi, patch) {
   const g = S._groups && S._groups[gi];
   if (!g) return;
+  // تغيير "اللي بيتابع" بس: نكتب الاسم الجديد زي ما هو.
+  // (الخطأ القديم: كان بيرجّع الاسم القديم فوق الجديد قبل الحفظ)
+  if ('assignedTo' in patch && !('status' in patch)) {
+    const val = patch.assignedTo || '';
+    for (const m of g.meds) m.assignedTo = val;
+    g.who = val;
+    render();
+    try { for (const m of g.meds) await storePatch('followups', m._id, { assignedTo: val }); }
+    catch (e) { alert('لم يُحفظ التغيير: ' + (e.message || e)); loadAll(); }
+    return;
+  }
   // نسجل الموظف تلقائيًا من قايمة "مين معانا؟" لو مختارش اسمه في الكارت،
   // عشان السجل ما يبقاش فيه تواصل بدون صاحبه.
   const who = g.who || S.me || '';
@@ -1122,6 +1133,13 @@ function viewCosmetics() {
 async function setCosStatus(i, patch) {
   const f = S._cosList && S._cosList[i];
   if (!f) return;
+  if ('assignedTo' in patch && !('status' in patch)) {
+    f.assignedTo = patch.assignedTo || '';
+    render();
+    try { await storePatch('followups', f._id, { assignedTo: f.assignedTo }); }
+    catch (e) { alert('لم يُحفظ: ' + (e.message || e)); loadAll(); }
+    return;
+  }
   const who = f.assignedTo || S.me || '';
   const logIt = LOGGED.includes(patch.status);
   if (logIt && !needStaff(who)) return;
