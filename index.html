@@ -483,7 +483,9 @@ async function uploadItemsTable(file, setProg) {
       packUnits: Number.isFinite(units) && units > 0 ? units : null,
       dailyDose: Number.isFinite(dose)  && dose  > 0 ? dose  : null,
       cycleDays: calcCycle(units, dose, cyc),
-      reviewed: true
+      reviewed: true,
+      ...(String(pick(r, ['كود الصنف', 'itemCode']) ?? '').trim()
+        ? { itemCode: String(pick(r, ['كود الصنف', 'itemCode'])).trim() } : {})
     });
   }
   setProg(45, `جاري حفظ ${out.length} صنف...`);
@@ -1493,6 +1495,21 @@ function viewLog() {
   return h;
 }
 
+// تصدير جدول الأصناف كله (للمراجعة وربط الأسماء القديمة بالجديدة)
+async function exportItems() {
+  const X = await ensureXlsx();
+  const rows = S.items.map(i => ({
+    'اسم الصنف': i.itemName, 'كود الصنف': i.itemCode || '', 'الاسم في الكاشير': i.posName || '',
+    'مزمن؟': i.isChronic ? 'نعم' : 'لا', 'التصنيف': i.category || '',
+    'وحدات العبوة': i.packUnits || '', 'الجرعة اليومية': i.dailyDose || '',
+    'دورة التذكير (يوم)': i.cycleDays || '', 'محتاج مراجعة': i.reviewed === false ? 'نعم' : '' }));
+  const ws = X.utils.json_to_sheet(rows);
+  ws['!cols'] = [{wch:45},{wch:10},{wch:45},{wch:7},{wch:30},{wch:10},{wch:10},{wch:10},{wch:10}];
+  const wb = X.utils.book_new();
+  X.utils.book_append_sheet(wb, ws, 'الأصناف');
+  X.writeFile(wb, 'الأصناف_' + todayStr() + '.xlsx');
+}
+
 async function exportLog() {
   const X = await ensureXlsx();
   const { list } = logFiltered();
@@ -1675,6 +1692,9 @@ function viewItems() {
   return `
   ${unrev ? `<div class="warn"><b>${unrev}</b> صنف جديد ظهر في آخر رفع ولسه محتاج مراجعة.
     راجعهم وحدد المزمن منهم عشان يدخلوا في المتابعة.</div>` : ''}
+  <div class="fl" style="justify-content:flex-start">
+    <button class="b" id="bExpItems" style="flex:0 0 auto">⬇ تصدير كل الأصناف (Excel)</button>
+  </div>
   <div class="fl">
     <select id="ifil">
       <option value="new"     ${S.itemFilter==='new'?'selected':''}>محتاج مراجعة</option>
@@ -1886,6 +1906,9 @@ function wire() {
   on('[data-dph]', 'click', e => copyText(e.currentTarget.dataset.dph, e.currentTarget));
 
   // --- الأصناف ---
+  const bExpItems = document.getElementById('bExpItems');
+  if (bExpItems) bExpItems.addEventListener('click', () =>
+    exportItems().catch(e => alert('التصدير فشل: ' + (e.message || e))));
   const ifil = document.getElementById('ifil');
   if (ifil) ifil.addEventListener('change', e => { S.itemFilter = e.target.value; render(); });
   const isr = document.getElementById('isrch');
