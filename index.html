@@ -293,6 +293,26 @@ function calcCycle(units, dose, fallback) {
   return Number.isFinite(f) && f > 0 ? f : 30;
 }
 
+// ---- ربط الأصناف بالكود ----
+// نظام الكاشير بيطلع المبيعات القديمة بالاسم الحالي للصنف، والداتا انتري بيعدّل الأسماء
+// (مثلاً "CONTROLOC 20MG" بقى "CONTROLOC 20MG 20TAB"). الكود هو اللي ثابت.
+// مفتاح المقارنة: بنشيل المسافات وعدد العبوة و MG عشان نلاقي الاسم القديم للصنف.
+function itemKey(name) {
+  return String(name || '').toUpperCase()
+    .replace(/^[*~\s]+/, '')
+    .replace(/\d*\s*(TABLETS?|TABS?|CAPSULES?|CAPS?|PCS|PC|T)\b\.?/g, ' ')
+    .replace(/MG/g, '')
+    .replace(/[^A-Z0-9\u0600-\u06FF]/g, '');
+}
+// عدد الأقراص = الرقم اللي قبل TAB/CAP مباشرة (مش أول رقم في الاسم)
+function packFromName(name) {
+  const m = [...String(name || '').toUpperCase()
+    .matchAll(/(\d+)\s*(TABLETS?|TABS?|CAPSULES?|CAPS?|T)\b/g)];
+  if (!m.length) return null;
+  const n = parseInt(m[m.length - 1][1], 10);
+  return n >= 5 && n <= 200 ? n : null;
+}
+
 function addDays(dateStr, n) {
   const d = new Date(dateStr);
   d.setDate(d.getDate() + n);
@@ -568,6 +588,76 @@ async function uploadSales(file, setProg) {
   const itemMap = new Map(S.items.map(i => [i.itemName, i]));
   const newItems = [];
 
+  // --- ربط بالكود: كل كود بيتربط بصنف واحد في التطبيق للأبد ---
+  const codeOf = r => String(pick(r, ['كود الصنف', 'كود', 'الكود', 'itemCode']) ?? '').trim();
+  const hasCodes = salesRows.some(r => codeOf(r));
+  const codeMap = new Map();
+  for (const i of S.items) if (i.itemCode) codeMap.set(String(i.itemCode), i);
+  const fileNames = new Set(), fileNameOfCode = new Map();
+  for (const r of salesRows) {
+    const n = String(pick(r, ['الصنف', 'اسم الصنف']) ?? '').trim(), c = codeOf(r);
+    if (n) fileNames.add(n);
+    if (c && n && !fileNameOfCode.has(c)) fileNameOfCode.set(c, n);
+  }
+  // صنف قديم من غير كود، واسمه مابقاش موجود في الملف = غالبًا اسمه اتغير
+  const orphanByKey = new Map();
+  for (const i of S.items) {
+    if (i.itemCode || fileNames.has(i.itemName)) continue;
+    const k = itemKey(i.itemName);
+    if (k.length < 4) continue;
+    if (!orphanByKey.has(k)) orphanByKey.set(k, []);
+    orphanByKey.get(k).push(i);
+  }
+  const newCodesByKey = new Map();
+  for (const [c, n] of fileNameOfCode) {
+    if (codeMap.has(c) || itemMap.has(n)) continue;
+    const k = itemKey(n);
+    newCodesByKey.set(k, (newCodesByKey.get(k) || 0) + 1);
+  }
+  const itemPatches = new Map();
+  const addPatch = (meta, p) => {
+    if (newItems.includes(meta)) return;           // الجديد بيتحفظ كامل تحت
+    itemPatches.set(meta.itemName, { ...(itemPatches.get(meta.itemName) || {}), ...p });
+  };
+  const renamed = [];
+  let packFilled = 0;
+
+  function resolveItem(name, code) {
+    let meta = null;
+    if (code && codeMap.has(code)) meta = codeMap.get(code);
+    else if (itemMap.has(name)) {
+      meta = itemMap.get(name);
+      if (code && !meta.itemCode) { meta.itemCode = code; codeMap.set(code, meta); addPatch(meta, { itemCode: code }); }
+    } else if (code) {
+      const k = itemKey(name);
+      const cands = orphanByKey.get(k);
+      if (cands && cands.length === 1 && newCodesByKey.get(k) === 1) {
+        meta = cands[0];
+        orphanByKey.delete(k);
+        meta.itemCode = code; codeMap.set(code, meta);
+        addPatch(meta, { itemCode: code });
+        renamed.push({ from: meta.itemName, to: name });
+      }
+    }
+    if (!meta) return null;
+    // الاسم الحالي في الكاشير (للعرض والمراجعة)
+    if (name !== meta.itemName && meta.posName !== name) { meta.posName = name; addPatch(meta, { posName: name }); }
+    // عدد الأقراص اتضاف للاسم؟ نكمّل بيه الصنف المزمن اللي كان ناقصه
+    if (meta.isChronic && !meta.packUnits) {
+      const u = packFromName(name);
+      if (u) {
+        const assumed = !meta.dailyDose;
+        const dose = meta.dailyDose || 1;
+        meta.packUnits = u; meta.dailyDose = dose;
+        meta.cycleDays = calcCycle(u, dose, meta.cycleDays);
+        addPatch(meta, { packUnits: u, dailyDose: dose, cycleDays: meta.cycleDays,
+                         doseAssumed: assumed });
+        packFilled++;
+      }
+    }
+    return meta;
+  }
+
   // 3) لكل (عميل + صنف مزمن): آخر تاريخ شراء
   setProg(35, 'جاري حساب مواعيد المتابعة...');
   const pairs = new Map();      // "عميل\u0000صنف" -> {…}  (مزمن)
@@ -585,12 +675,15 @@ async function uploadSales(file, setProg) {
     if (isGenericName(cust)) { skippedGeneric++; continue; }
     seenCustomers.add(cust);
 
-    let meta = itemMap.get(item);
+    const code = codeOf(r);
+    let meta = resolveItem(item, code);
     if (!meta) {                       // صنف جديد: يُسجَّل غير مزمن حتى يراجعه الصيدلي
       meta = { itemName: item, isChronic: false, category: '', packUnits: null, dailyDose: null, cycleDays: 30, reviewed: false };
+      if (code) { meta.itemCode = code; codeMap.set(code, meta); }
       itemMap.set(item, meta);
       newItems.push(meta);
     }
+    const canon = meta.itemName;       // الاسم الثابت في التطبيق — عليه متابعات العملاء
 
     // منتجات التجميل: الفئة من نظام الكاشير + سعر الوحدة فوق الحد.
     // السعر لوحده مش كافي — فيه أدوية كتير فوق 200 ج.
@@ -600,23 +693,23 @@ async function uploadSales(file, setProg) {
       const tot  = parseFloat(pick(r, ['المجموع'])) || 0;
       const unit = qty > 0 ? tot / qty : 0;
       if (unit > COSMETIC_MIN_PRICE && dt) {
-        const ck = cust + '\u0000' + item;
+        const ck = cust + '\u0000' + canon;
         const cur = cosPairs.get(ck);
         if (!cur || dt > cur.lastPurchaseDate)
-          cosPairs.set(ck, { customerName: cust, itemName: item, posCat,
+          cosPairs.set(ck, { customerName: cust, itemName: canon, posCat,
                              price: Math.round(unit), lastPurchaseDate: dt });
       }
     }
 
     if (!meta.isChronic) continue;
 
-    const key = cust + '\u0000' + item;
+    const key = cust + '\u0000' + canon;
     const cur = pairs.get(key);
     const qty = Math.max(1, parseFloat(pick(r, ['الكمية'])) || 1);
     if (!cur || (dt && dt > cur.lastPurchaseDate)) {
       pairs.set(key, {
         customerName: cust,
-        itemName: item,
+        itemName: canon,
         category: meta.category || '',
         cycleDays: meta.cycleDays || 30,
         lastPurchaseDate: dt || (cur ? cur.lastPurchaseDate : todayStr()),
@@ -705,6 +798,10 @@ async function uploadSales(file, setProg) {
   // (assignedTo بيفضل فاضي لحد ما حد يختار نفسه)
 
   // 6) الحفظ
+  if (itemPatches.size) {
+    setProg(62, `جاري ربط ${itemPatches.size} صنف بالكود...`);
+    await storePut('items', [...itemPatches].map(([n, p]) => ({ _id: n, ...p })));
+  }
   if (newItems.length) {
     setProg(65, `جاري حفظ ${newItems.length} صنف جديد...`);
     await writeChunks('items', newItems, r => r.itemName, null);
@@ -746,7 +843,7 @@ async function uploadSales(file, setProg) {
 
   setProg(100, 'تم.');
   return {
-    revived,
+    revived, renamed, packFilled, hasCodes,
     scanned, saved: rows.length, newItems: newItems.length, cosCount,
     hadPhoneSheet: !!phoneRows,
     noPhone, skippedGeneric,
@@ -1902,6 +1999,7 @@ function wire() {
 • ${r.newItems} صنف جديد محتاج مراجعة
 • ${r.noPhone} متابعة من غير رقم صالح (مش هتظهر في القايمة)
 • ${r.skippedGeneric} سطر اتستبعد (أسماء عامة زي "عميل زائر")
+${r.packFilled ? '• ' + r.packFilled + ' صنف مزمن اتكمّل عدد أقراصه من الاسم الجديد (الجرعة افتراضي قرص/يوم — راجعها في تاب الأصناف)\n' : ''}${r.hasCodes ? '' : '\n⚠ الملف مفيهوش عمود "كود الصنف" — الأصناف اتربطت بالاسم بس. صدّر المبيعات بعمود الكود.'}${r.renamed.length ? '\n\n🔁 ' + r.renamed.length + ' صنف اسمه اتغير في الكاشير واتربط بالقديم:\n' + r.renamed.map(x => '• ' + esc(x.from) + '  ←  ' + esc(x.to)).join('\n') : ''}
 ${r.revived ? '\n✅ ' + r.revived + ' عميل من قايمة "بعُدوا عننا" رجعوا اشتروا — اتشالوا من القايمة تلقائيًا.' : ''}${r.hadPhoneSheet ? '' : '\n⚠ الملف ده مفيهوش شيت أرقام — استخدمنا الأرقام المحفوظة من قبل. العملاء الجدد اللي ظهروا لأول مرة هيبقوا من غير رقم لحد ما ترفع ملف فيه الأرقام.'}</div>`;
     } catch (e) {
       document.getElementById('pSales').innerHTML = `<div class="err">${esc(e.message || e)}</div>`;
