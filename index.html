@@ -178,7 +178,7 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
 // نسخة الفريق — البيانات على Firestore، فكل الموظفين بيشوفوا نفس القايمة لحظيًا.
 // لازم تفتح من لينك (https) — مش من ملف على الجهاز، لأن Firebase بيرفض file://
 import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js';
-import { getFirestore, collection, doc, getDocs, setDoc, updateDoc, writeBatch }
+import { getFirestore, collection, doc, getDocs, setDoc, updateDoc, writeBatch, deleteDoc }
   from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js';
 import { getAuth, signInAnonymously } from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js';
 
@@ -1514,7 +1514,7 @@ function viewUpload() {
   </div>
   <div class="card">
     <h2>الفريق</h2>
-    <p class="meta">المتابعات المستحقة بتتوزع بالتساوي على الموظفين النشطين وقت كل رفع.</p>
+    <p class="meta">اضغط ✏️ لتعديل اسم موظف — الاسم الجديد بيتغيّر في كل المتابعات وسجل التواصل القديم كمان. المفتاح بيوقف/يشغّل الموظف.</p>
     <div id="staffList"></div>
     <label>إضافة موظف</label>
     <div class="fl"><input id="newStaff" placeholder="الاسم"><button class="b wa" id="bAddStaff" style="flex:0 0 auto">إضافة</button></div>
@@ -1528,7 +1528,10 @@ function renderStaffList() {
   box.innerHTML = S.staff.map(s => `
     <div class="fl" style="justify-content:space-between">
       <span>${esc(s.name)}</span>
-      <button class="sw ${s.active ? 'on' : ''}" data-st="${esc(s.name)}"><i></i></button>
+      <span class="fl" style="flex:0 0 auto;gap:8px">
+        <button class="b" data-rn="${esc(s.name)}" title="تعديل الاسم" style="flex:0 0 auto;padding:4px 10px">✏️</button>
+        <button class="sw ${s.active ? 'on' : ''}" data-st="${esc(s.name)}"><i></i></button>
+      </span>
     </div>`).join('');
 }
 
@@ -1915,6 +1918,19 @@ ${r.revived ? '\n✅ ' + r.revived + ' عميل من قايمة "بعُدوا ع
       inp.value = ''; await loadAll();
     } catch (e) { alert('لم يُحفظ: ' + (e.message || e)); }
   });
+  on('[data-rn]', 'click', async e => {
+    const oldName = e.currentTarget.dataset.rn;
+    const input = prompt('الاسم الجديد لـ "' + oldName + '":', oldName);
+    if (input === null) return;
+    const newName = input.trim();
+    if (!newName || newName === oldName) return;
+    const exists = S.staff.some(x => x.name === newName);
+    if (exists && !confirm('"' + newName + '" موجود بالفعل.\nتدمج "' + oldName + '" فيه؟ (كل متابعاته هتتنقل للاسم ده)')) return;
+    try {
+      await renameStaff(oldName, newName);
+      alert('تم ✅ الاسم اتعدّل في كل المتابعات والسجل.');
+    } catch (e2) { alert('لم يُحفظ: ' + (e2.message || e2)); }
+  });
   on('[data-st]', 'click', async e => {
     const n = e.currentTarget.dataset.st;
     const s = S.staff.find(x => x.name === n);
@@ -1923,6 +1939,47 @@ ${r.revived ? '\n✅ ' + r.revived + ' عميل من قايمة "بعُدوا ع
       s.active = !s.active; renderStaffList();
     } catch (e2) { alert('لم يُحفظ: ' + (e2.message || e2)); }
   });
+}
+
+// --- تعديل اسم موظف: بيغيّر الاسم في كل مكان متسجل فيه ---
+async function renameStaff(oldName, newName) {
+  const old = S.staff.find(x => x.name === oldName);
+  const target = S.staff.find(x => x.name === newName);
+  const active = !!((old && old.active) || (target && target.active));
+
+  // 1) المتابعات (المزمن + التجميل): المسؤول + اللي اتواصل
+  const fu = [];
+  for (const f of S.followups) {
+    const p = {};
+    if (f.assignedTo === oldName) p.assignedTo = newName;
+    if (f.contactedBy === oldName) p.contactedBy = newName;
+    if (Object.keys(p).length) fu.push({ _id: f._id, ...p });
+  }
+  // 2) "بعُدوا عننا"
+  const lp = [];
+  for (const x of S.lapsed) {
+    const p = {};
+    if (x.assignedTo === oldName) p.assignedTo = newName;
+    if (x.contactedBy === oldName) p.contactedBy = newName;
+    if (Object.keys(p).length) lp.push({ _id: x._id, ...p });
+  }
+  // 3) سجل التواصل
+  const ct = S.contacts.filter(c => c.staff === oldName).map(c => ({ _id: c._id, staff: newName }));
+
+  // الاسم الجديد الأول، وبعدين نقل السجلات، وآخر حاجة مسح القديم
+  await storePut('staff', [{ _id: cleanId(newName), name: newName, active }]);
+  if (fu.length) await storePut('followups', fu);
+  if (lp.length) await storePut('lapsed', lp);
+  if (ct.length) await storePut('contacts', ct);
+  if (cleanId(oldName) !== cleanId(newName)) await deleteDoc(doc(db, 'staff', cleanId(oldName)));
+
+  // الجهاز الحالي: لو "مين معانا؟" أو الفلاتر على الاسم القديم
+  if (S.me === oldName) { S.me = newName; LS.set(ME_KEY, newName); }
+  if (S.filterStaff === oldName) S.filterStaff = newName;
+  if (S.logStaff === oldName) S.logStaff = newName;
+
+  await loadAll();
+  return { followups: fu.length, lapsed: lp.length, contacts: ct.length };
 }
 
 // ============================================================================
