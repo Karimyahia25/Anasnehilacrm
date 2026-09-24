@@ -1606,6 +1606,38 @@ function viewLog() {
   return h;
 }
 
+// ---- النسخة الاحتياطية: كل المجموعات في ملف واحد، شيت لكل مجموعة ----
+const BACKUP_KEY = 'pharma_last_backup_v1';
+const BACKUP_SHEETS = { followups: 'المتابعات', contacts: 'سجل التواصل', items: 'الأصناف',
+                        lapsed: 'بعدوا عننا', staff: 'الفريق' };
+function flatCell(v) {
+  if (v === null || v === undefined) return '';
+  if (Array.isArray(v)) v = v.map(x => typeof x === 'object' ? JSON.stringify(x) : x).join(' | ');
+  else if (typeof v === 'object') v = JSON.stringify(v);
+  if (typeof v === 'string' && v.length > 32000) v = v.slice(0, 32000);
+  return v;
+}
+async function exportBackup(setProg) {
+  const X = await ensureXlsx();
+  const wb = X.utils.book_new();
+  const info = [['تاريخ النسخة', new Date().toLocaleString('ar-EG')]];
+  const names = Object.keys(BACKUP_SHEETS);
+  for (let k = 0; k < names.length; k++) {
+    const col = names[k];
+    setProg(10 + k * 17, 'جاري تحميل ' + BACKUP_SHEETS[col] + '...');
+    const docs = await storeAll(col);           // من قاعدة البيانات مباشرة، مش من الشاشة
+    const keys = ['_id', ...new Set(docs.flatMap(d => Object.keys(d)).filter(x => x !== '_id'))];
+    const aoa = [keys, ...docs.map(d => keys.map(x => flatCell(d[x])))];
+    X.utils.book_append_sheet(wb, X.utils.aoa_to_sheet(aoa), BACKUP_SHEETS[col]);
+    info.push([BACKUP_SHEETS[col], docs.length]);
+  }
+  X.utils.book_append_sheet(wb, X.utils.aoa_to_sheet(info), 'معلومات');
+  setProg(95, 'جاري حفظ الملف...');
+  X.writeFile(wb, 'نسخة_احتياطية_متابعة_' + todayStr() + '.xlsx');
+  LS.set(BACKUP_KEY, new Date().toISOString());
+  setProg(100, 'تم ✅ ' + info.slice(1).map(r => r[0] + ': ' + r[1]).join(' • '));
+}
+
 // تصدير جدول الأصناف كله (للمراجعة وربط الأسماء القديمة بالجديدة)
 async function exportItems() {
   const X = await ensureXlsx();
@@ -1728,7 +1760,12 @@ function drugMessage(i) {
 // ---------- شاشة 2: رفع البيانات ----------
 function viewUpload() {
   const unrev = S.items.filter(i => i.reviewed === false).length;
+  const lastBk = LS.get(BACKUP_KEY);
+  const bkDays = lastBk ? Math.floor((Date.now() - new Date(lastBk).getTime()) / 86400000) : null;
+  const bkLate = bkDays === null || bkDays >= 7;
   return `
+  ${bkLate ? `<div class="warn">💾 ${bkDays === null ? 'لسه ماتعملتش نسخة احتياطية من الجهاز ده.' : 'آخر نسخة احتياطية من ' + bkDays + ' يوم.'}
+    انزل لكارت "النسخة الاحتياطية" تحت ودوس الزرار.</div>` : ''}
   ${unrev ? `<div class="warn">فيه <b>${unrev}</b> صنف جديد لسه محتاج مراجعة في تبويب الأصناف.</div>` : ''}
   <div class="card">
     <h2>1 · جدول الأصناف</h2>
@@ -1754,6 +1791,14 @@ function viewUpload() {
     <input type="file" id="fLap" accept=".xlsx,.xls">
     <button class="big" id="bLap">رفع ملف العملاء اللي بعدوا</button>
     <div id="pLap"></div>
+  </div>
+  <div class="card">
+    <h2>💾 النسخة الاحتياطية</h2>
+    <p>بتنزّل كل بيانات التطبيق (المتابعات، سجل التواصل، الأصناف، بعُدوا عننا، الفريق) في ملف إكسل واحد.
+      اعملها مرة في الأسبوع واحفظ الملف في مكان آمن (فلاشة أو Google Drive).</p>
+    <button class="big" id="bBackup">تنزيل نسخة احتياطية</button>
+    <div id="pBackup"></div>
+    <p class="meta" style="margin-top:8px">${lastBk ? 'آخر نسخة من الجهاز ده: ' + esc(fmtTime(lastBk)) : 'مفيش نسخة سابقة من الجهاز ده.'}</p>
   </div>
   <div class="card">
     <h2>الفريق</h2>
@@ -2039,6 +2084,15 @@ function wire() {
   on('[data-dph]', 'click', e => copyText(e.currentTarget.dataset.dph, e.currentTarget));
 
   // --- الأصناف ---
+  const bBackup = document.getElementById('bBackup');
+  if (bBackup) bBackup.addEventListener('click', async () => {
+    bBackup.disabled = true;
+    const p = progressBox('pBackup');
+    try { await exportBackup(p); }
+    catch (e) { document.getElementById('pBackup').innerHTML =
+      `<div class="warn">النسخة ما اتعملتش: ${esc(e.message || e)}</div>`; }
+    bBackup.disabled = false;
+  });
   const bExpItems = document.getElementById('bExpItems');
   if (bExpItems) bExpItems.addEventListener('click', () =>
     exportItems().catch(e => alert('التصدير فشل: ' + (e.message || e))));
