@@ -272,6 +272,8 @@ let S = {
   contacts: [],
   method: LS.get('pharma_method_v1') || 'whatsapp',
   logMethod: 'all',
+  logOutcome: 'all',
+  showReasoned: false,
   logPeriod: '30'
 };
 
@@ -633,6 +635,7 @@ async function uploadSales(file, setProg) {
   };
   const renamed = [];
   let packFilled = 0;
+  const custBuys = new Map();
 
   function resolveItem(name, code) {
     let meta = null;
@@ -696,6 +699,14 @@ async function uploadSales(file, setProg) {
       newItems.push(meta);
     }
     const canon = meta.itemName;       // الاسم الثابت في التطبيق — عليه متابعات العملاء
+
+    // مشتريات كل عميل بالتاريخ — عشان نعرف مين رجع بعد التواصل
+    if (dt) {
+      const amt = parseFloat(pick(r, ['المجموع', 'الإجمالي'])) || 0;
+      if (!custBuys.has(cust)) custBuys.set(cust, new Map());
+      const m = custBuys.get(cust);
+      m.set(dt, (m.get(dt) || 0) + amt);
+    }
 
     // منتجات التجميل: الفئة من نظام الكاشير + سعر الوحدة فوق الحد.
     // السعر لوحده مش كافي — فيه أدوية كتير فوق 200 ج.
@@ -809,7 +820,48 @@ async function uploadSales(file, setProg) {
   // لا يوجد توزيع تلقائي — الموظف بيختار اسمه من الكارت وهو بيتابع العميل.
   // (assignedTo بيفضل فاضي لحد ما حد يختار نفسه)
 
+  // 5b) مين رجع بعد التواصل؟ أي شراء خلال 10 أيام من التواصل بيتحسب للموظف اللي كلمه.
+  //     لو العميل اتكلم أكتر من مرة، الشراء بيتحسب لآخر تواصل قبله بس.
+  const convPatches = [];
+  let convCount = 0, convAmount = 0;
+  const evByCust = new Map();
+  for (const e of S.contacts) {
+    if (!e._id || !e.at || e.convertedOn || e.coveredBy) continue;
+    if (!custBuys.has(e.customerName)) continue;
+    if (!evByCust.has(e.customerName)) evByCust.set(e.customerName, []);
+    evByCust.get(e.customerName).push(e);
+  }
+  for (const [cust, evs] of evByCust) {
+    const dates = [...custBuys.get(cust).keys()].sort();
+    evs.sort((a, b) => b.at.localeCompare(a.at));          // الأحدث الأول
+    const used = new Set();
+    for (const dt of dates) {
+      const eligible = evs.filter(e => !used.has(e._id) &&
+        e.at.slice(0, 10) <= dt && dt <= addDays(e.at.slice(0, 10), CONVERT_DAYS));
+      if (!eligible.length) continue;
+      const main = eligible[0];
+      const d0 = main.at.slice(0, 10), end = addDays(d0, CONVERT_DAYS);
+      let amount = 0;
+      for (const [d, v] of custBuys.get(cust)) if (d >= d0 && d <= end) amount += v;
+      amount = Math.round(amount);
+      const p = { _id: main._id, convertedOn: dt, convertedAmount: amount,
+                  outcome: 'returned', autoConverted: main.outcome !== 'returned' };
+      Object.assign(main, p); convPatches.push(p);
+      convCount++; convAmount += amount;
+      for (const e of eligible) {
+        used.add(e._id);
+        if (e === main) continue;
+        const q = { _id: e._id, coveredBy: main._id };
+        Object.assign(e, q); convPatches.push(q);
+      }
+    }
+  }
+
   // 6) الحفظ
+  if (convPatches.length) {
+    setProg(60, `جاري تسجيل ${convCount} عميل رجع بعد التواصل...`);
+    await storePut('contacts', convPatches);
+  }
   if (itemPatches.size) {
     setProg(62, `جاري ربط ${itemPatches.size} صنف بالكود...`);
     await storePut('items', [...itemPatches].map(([n, p]) => ({ _id: n, ...p })));
@@ -855,7 +907,7 @@ async function uploadSales(file, setProg) {
 
   setProg(100, 'تم.');
   return {
-    revived, renamed, packFilled, hasCodes,
+    revived, renamed, packFilled, hasCodes, convCount, convAmount,
     scanned, saved: rows.length, newItems: newItems.length, cosCount,
     hadPhoneSheet: !!phoneRows,
     noPhone, skippedGeneric,
@@ -1381,6 +1433,22 @@ async function setLapStatus(i, patch) {
 const SRC_LABEL = { chronic: 'متابعة دورية', cos_sat: 'استطلاع تجميل',
   cos_rep: 'إعادة شراء تجميل', lapsed: 'بعُدوا عننا' };
 const OUT_LABEL = { contacted: 'تم التواصل', returned: 'اشترى / رجع', no_answer: 'مردش' };
+// العميل اللي يشتري خلال المدة دي من التواصل = رجع بسبب التواصل (بيتعرف من رفع المبيعات)
+const CONVERT_DAYS = 10;
+const NORET_REASONS = {
+  stopped: 'وقف الدوا / الدكتور غيّره',
+  other_pharmacy: 'بيشتري من صيدلية تانية',
+  has_stock: 'لسه معاه دوا',
+  unreachable: 'مردش تاني',
+  other: 'سبب تاني'
+};
+// تواصل عدّى عليه 10 أيام ومشتراش ولسه ماتسجلش سبب
+function isNoReturn(e) {
+  if (e.legacy || !e._id) return false;
+  if (e.outcome === 'returned' || e.convertedOn || e.coveredBy) return false;
+  const d0 = (e.at || '').slice(0, 10);
+  return !!d0 && addDays(d0, CONVERT_DAYS) < todayStr();
+}
 
 function logEvents() {
   const events = [...S.contacts];
@@ -1417,6 +1485,13 @@ function logFiltered() {
   let list = inPeriod;
   if (S.logStaff && S.logStaff !== '__all__') list = list.filter(e => (e.staff || '') === S.logStaff);
   if (S.logMethod !== 'all') list = list.filter(e => e.method === S.logMethod);
+  if (S.logOutcome === 'conv') list = list.filter(e => e.outcome === 'returned');
+  if (S.logOutcome === 'noret') {
+    // مرجعوش: بنعرض كل الفترة (التواصل لازم يكون عدّى عليه 10 أيام أصلاً)
+    list = logEvents().filter(isNoReturn);
+    if (S.logStaff && S.logStaff !== '__all__') list = list.filter(e => (e.staff || '') === S.logStaff);
+    if (!S.showReasoned) list = list.filter(e => !e.noReturnReason);
+  }
   return { inPeriod, list };
 }
 
@@ -1431,8 +1506,10 @@ function viewLog() {
   const byStaff = {};
   for (const e of inPeriod) {
     const w = e.staff || '(غير محدد)';
-    const r = byStaff[w] = byStaff[w] || { all: 0, wa: 0, ph: 0, buy: 0, na: 0 };
+    const r = byStaff[w] = byStaff[w] || { all: 0, wa: 0, ph: 0, buy: 0, na: 0, amt: 0, nr: 0 };
     r.all++;
+    r.amt += e.convertedAmount || 0;
+    if (isNoReturn(e)) r.nr++;
     if (e.method === 'whatsapp') r.wa++;
     if (e.method === 'phone') r.ph++;
     if (e.outcome === 'returned') r.buy++;
@@ -1458,6 +1535,11 @@ function viewLog() {
       <option value="whatsapp" ${S.logMethod==='whatsapp'?'selected':''}>واتساب</option>
       <option value="phone"    ${S.logMethod==='phone'?'selected':''}>تليفون</option>
     </select>
+    <select id="lgo">
+      <option value="all"   ${S.logOutcome==='all'?'selected':''}>كل النتايج</option>
+      <option value="conv"  ${S.logOutcome==='conv'?'selected':''}>✓ اشتروا بعد التواصل</option>
+      <option value="noret" ${S.logOutcome==='noret'?'selected':''}>✗ اتواصلنا ومرجعوش (${CONVERT_DAYS} أيام)</option>
+    </select>
     <button class="cp" id="lgx">تصدير إكسل</button>
   </div>`;
 
@@ -1466,19 +1548,26 @@ function viewLog() {
     <div><b>${list.filter(e => e.method === 'whatsapp').length}</b><span>واتساب</span></div>
     <div><b>${list.filter(e => e.method === 'phone').length}</b><span>تليفون</span></div>
     <div><b>${list.filter(e => e.outcome === 'returned').length}</b><span>اشتروا / رجعوا</span></div>
+    <div><b>${list.reduce((a, e) => a + (e.convertedAmount || 0), 0).toLocaleString('en')}</b><span>ج رجعت بعد التواصل</span></div>
     <div><b>${list.filter(e => e.outcome === 'no_answer').length}</b><span>مردوش</span></div>
   </div>`;
 
   if (Object.keys(byStaff).length) {
     h += `<div class="card"><h2>حسب الموظف</h2><div class="scroll" style="max-height:none">
       <table><thead><tr><th>الموظف</th><th>تواصل</th><th>واتساب</th><th>تليفون</th>
-        <th>اشتروا</th><th>مردوش</th><th>نسبة الشراء</th></tr></thead><tbody>
+        <th>اشتروا</th><th>مبيعات رجعت</th><th>مرجعوش</th><th>مردوش</th><th>نسبة الشراء</th></tr></thead><tbody>
       ${Object.entries(byStaff).sort((a, b) => b[1].all - a[1].all).map(([w, v]) =>
         `<tr><td>${esc(w)}</td><td>${v.all}</td><td>${v.wa}</td><td>${v.ph}</td>
-         <td>${v.buy}</td><td>${v.na}</td><td>${v.all ? Math.round(100 * v.buy / v.all) : 0}%</td></tr>`).join('')}
+         <td>${v.buy}</td><td>${v.amt ? v.amt.toLocaleString('en') + ' ج' : '—'}</td><td>${v.nr}</td>
+         <td>${v.na}</td><td>${v.all ? Math.round(100 * v.buy / v.all) : 0}%</td></tr>`).join('')}
       </tbody></table></div></div>`;
   }
 
+  if (S.logOutcome === 'noret') {
+    h += `<div class="warn">دول عملاء اتواصلنا معاهم من أكتر من ${CONVERT_DAYS} أيام ومشتروش. كلّمهم تاني أو اسأل عن السبب واختاره.
+      "وقف الدوا" بيوقف متابعة الأصناف دي تلقائي.
+      <label style="display:block;margin-top:6px"><input type="checkbox" id="lgr" ${S.showReasoned ? 'checked' : ''}> اعرض كمان اللي اتسجل سببهم</label></div>`;
+  }
   if (!list.length) {
     h += `<div class="empty"><div class="ic">📞</div><p>مفيش تواصل مسجل في الفلتر ده.</p></div>`;
     return h;
@@ -1499,9 +1588,16 @@ function viewLog() {
       <div class="meta logmeta">
         <span>🕒 ${esc(fmtTime(e.at))}</span>
         <span>👤 ${esc(e.staff || 'غير محدد')}</span>
+        ${e.convertedOn ? `<span>🎯 اشترى ${esc(e.convertedOn)}${e.convertedAmount ? ' • ' + e.convertedAmount.toLocaleString('en') + ' ج' : ''}${e.autoConverted ? ' (من المبيعات)' : ''}</span>` : ''}
         <span>${e.method === 'phone' ? '📞 تليفون' : e.method === 'whatsapp' ? '💬 واتساب'
           : '— (قبل تسجيل طريقة التواصل)'}</span>
       </div>
+      ${isNoReturn(e) ? `<div class="fl" style="margin-top:6px">
+        <select data-nr="${esc(e._id)}">
+          <option value="">— مرجعش ليه؟ —</option>
+          ${Object.entries(NORET_REASONS).map(([k, v]) =>
+            `<option value="${k}" ${e.noReturnReason === k ? 'selected' : ''}>${v}</option>`).join('')}
+        </select></div>` : ''}
     </div>`;
   });
   if (list.length > 300) h += `<p class="meta">أحدث 300 من ${list.length} — التصدير فيه الكل.</p>`;
@@ -1879,6 +1975,28 @@ function wire() {
   if (lgs) lgs.addEventListener('change', e => { S.logStaff = e.target.value; render(); });
   const lgp = document.getElementById('lgp');
   if (lgp) lgp.addEventListener('change', e => { S.logPeriod = e.target.value; render(); });
+  const lgo = document.getElementById('lgo');
+  if (lgo) lgo.addEventListener('change', e => { S.logOutcome = e.target.value; render(); });
+  const lgr = document.getElementById('lgr');
+  if (lgr) lgr.addEventListener('change', e => { S.showReasoned = e.target.checked; render(); });
+  document.querySelectorAll('[data-nr]').forEach(el => el.addEventListener('change', async ev => {
+    const id = ev.target.dataset.nr, reason = ev.target.value;
+    const e = S.contacts.find(x => x._id === id);
+    if (!e || !reason) return;
+    e.noReturnReason = reason; e.noReturnBy = S.me || '';
+    try {
+      await storePut('contacts', [{ _id: id, noReturnReason: reason, noReturnBy: e.noReturnBy }]);
+      // وقف الدوا: نوقف متابعة الأصناف دي للعميل ده
+      if (reason === 'stopped') {
+        const items = new Set(e.items || []);
+        const fs = S.followups.filter(f => f.customerName === e.customerName &&
+          (f.kind || 'chronic') === 'chronic' && (!items.size || items.has(f.itemName)));
+        for (const f of fs) f.optedOut = true;
+        if (fs.length) await storePut('followups', fs.map(f => ({ _id: f._id, optedOut: true })));
+      }
+    } catch (err) { alert('لم يُحفظ: ' + (err.message || err)); }
+    render();
+  }));
   const lgm = document.getElementById('lgm');
   if (lgm) lgm.addEventListener('change', e => { S.logMethod = e.target.value; render(); });
   const lgx = document.getElementById('lgx');
@@ -2035,7 +2153,7 @@ function wire() {
 • ${r.newItems} صنف جديد محتاج مراجعة
 • ${r.noPhone} متابعة من غير رقم صالح (مش هتظهر في القايمة)
 • ${r.skippedGeneric} سطر اتستبعد (أسماء عامة زي "عميل زائر")
-${r.packFilled ? '• ' + r.packFilled + ' صنف مزمن اتكمّل عدد أقراصه من الاسم الجديد (الجرعة افتراضي قرص/يوم — راجعها في تاب الأصناف)\n' : ''}${r.hasCodes ? '' : '\n⚠ الملف مفيهوش عمود "كود الصنف" — الأصناف اتربطت بالاسم بس. صدّر المبيعات بعمود الكود.'}${r.renamed.length ? '\n\n🔁 ' + r.renamed.length + ' صنف اسمه اتغير في الكاشير واتربط بالقديم:\n' + r.renamed.map(x => '• ' + esc(x.from) + '  ←  ' + esc(x.to)).join('\n') : ''}
+${r.convCount ? '🎯 ' + r.convCount + ' عميل اشترى خلال ' + CONVERT_DAYS + ' أيام من التواصل (' + r.convAmount.toLocaleString('en') + ' ج) — اتحسبوا للموظفين في سجل التواصل\n' : ''}${r.packFilled ? '• ' + r.packFilled + ' صنف مزمن اتكمّل عدد أقراصه من الاسم الجديد (الجرعة افتراضي قرص/يوم — راجعها في تاب الأصناف)\n' : ''}${r.hasCodes ? '' : '\n⚠ الملف مفيهوش عمود "كود الصنف" — الأصناف اتربطت بالاسم بس. صدّر المبيعات بعمود الكود.'}${r.renamed.length ? '\n\n🔁 ' + r.renamed.length + ' صنف اسمه اتغير في الكاشير واتربط بالقديم:\n' + r.renamed.map(x => '• ' + esc(x.from) + '  ←  ' + esc(x.to)).join('\n') : ''}
 ${r.revived ? '\n✅ ' + r.revived + ' عميل من قايمة "بعُدوا عننا" رجعوا اشتروا — اتشالوا من القايمة تلقائيًا.' : ''}${r.hadPhoneSheet ? '' : '\n⚠ الملف ده مفيهوش شيت أرقام — استخدمنا الأرقام المحفوظة من قبل. العملاء الجدد اللي ظهروا لأول مرة هيبقوا من غير رقم لحد ما ترفع ملف فيه الأرقام.'}</div>`;
     } catch (e) {
       document.getElementById('pSales').innerHTML = `<div class="err">${esc(e.message || e)}</div>`;
