@@ -229,7 +229,7 @@ const DEFAULT_MSG3 =
 + 'حابين نطمن، إيه رأيك في:\n'
 + '{الأدوية}\n\n'
 + 'ظبط معاك؟ حاسس بفرق؟\n'
-+ 'لو فيه أي ملاحظة أو حاسس إنه مش مناسب لبشرتك، قولنا وهنرشحلك البديل المناسب 💚';
++ 'لو فيه أي ملاحظة أو حاسس إنه مش مناسب ليك، قولنا وهنرشحلك البديل المناسب 💚';
 
 const DEFAULT_MSG4 =
   'أهلاً {اسم_العميل} 🌿\n'
@@ -375,7 +375,9 @@ function saveMsg(v) { LS.set(MSG_KEY, v); }
 function getMsg()   { return LS.get(MSG_KEY) || DEFAULT_MSG; }
 function getMsg2()  { return LS.get(MSG2_KEY) || DEFAULT_MSG2; }
 function saveMsg2(v){ LS.set(MSG2_KEY, v); }
-function getMsg3()  { return LS.get(MSG3_KEY) || DEFAULT_MSG3; }
+// المنتج ممكن يكون للشعر مش للبشرة — النص المحفوظ القديم بيتصلح تلقائي
+function getMsg3()  { const v = LS.get(MSG3_KEY);
+  return v ? v.replace('مش مناسب لبشرتك', 'مش مناسب ليك') : DEFAULT_MSG3; }
 function saveMsg3(v){ LS.set(MSG3_KEY, v); }
 function getMsg4()  { return LS.get(MSG4_KEY) || DEFAULT_MSG4; }
 function saveMsg4(v){ LS.set(MSG4_KEY, v); }
