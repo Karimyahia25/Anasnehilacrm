@@ -296,6 +296,27 @@ function calcCycle(units, dose, fallback) {
   return Number.isFinite(f) && f > 0 ? f : 30;
 }
 
+// ملف أرقام لوحده (من غير مبيعات)
+async function registerPhonesOnly(phoneOf, phonesOf, setProg) {
+  setProg(40, 'جاري تسجيل العملاء...');
+  const regMap = new Map((S.customers || []).map(c => [c.name, c]));
+  const rows = [];
+  for (const [n, ph] of phoneOf) {
+    if (isGenericName(n)) continue;
+    const c = regMap.get(n);
+    if (!c) rows.push({ _id: n, name: n, firstSeen: 'seed', phone: ph });
+    else if (c.phone !== ph) rows.push({ _id: n, phone: ph });
+  }
+  if (rows.length) await writeChunks('customers', rows, r => r._id, setProg, 40, 75);
+  // نكمّل الأرقام الناقصة في المتابعات
+  const fix = S.followups.filter(f => !f.phoneValid && phoneOf.get(f.customerName))
+    .map(f => ({ _id: f._id, customerPhone: phoneOf.get(f.customerName),
+                 phonesExtra: (phonesOf.get(f.customerName) || []).slice(1), phoneValid: true }));
+  if (fix.length) { setProg(80, `جاري إضافة أرقام لـ ${fix.length} متابعة...`); await storePut('followups', fix); }
+  setProg(100, 'تم.');
+  return { phonesOnly: true, registered: rows.length, fixed: fix.length };
+}
+
 // ---- ربط الأصناف بالكود ----
 // نظام الكاشير بيطلع المبيعات القديمة بالاسم الحالي للصنف، والداتا انتري بيعدّل الأسماء
 // (مثلاً "CONTROLOC 20MG" بقى "CONTROLOC 20MG 20TAB"). الكود هو اللي ثابت.
@@ -383,11 +404,19 @@ function saveMsg3(v){ LS.set(MSG3_KEY, v); }
 function getMsg4()  { return LS.get(MSG4_KEY) || DEFAULT_MSG4; }
 function saveMsg4(v){ LS.set(MSG4_KEY, v); }
 function getMsg5()  { return LS.get(MSG5_KEY) || DEFAULT_MSG5; }
+const MSG6_KEY = 'pharma_msg6_v1';   // ترحيب بعميل جديد بعد أول شراء
+const WELCOME_DAYS = 3;
+const DEFAULT_MSG6 =
+  'أهلاً {اسم_العميل} 🌿\n'
++ 'معاك صيدلية أنس نحيلة، نورتنا من كام يوم وحبينا نطمن إن كل حاجة كانت تمام معاك.\n\n'
++ 'لو احتجت أي استشارة أو أي حاجة من الصيدلية، إحنا موجودين في أي وقت وتقدر تكلمنا على الرقم ده 💚';
+function getMsg6()  { return LS.get(MSG6_KEY) || DEFAULT_MSG6; }
+function saveMsg6(v){ LS.set(MSG6_KEY, v); }
 function saveMsg5(v){ LS.set(MSG5_KEY, v); }
 
 // ============================ طبقة التخزين: Firestore ============================
 // نفس أسماء الدوال المستخدمة في النسخة المحلية، فباقي التطبيق ما اتغيرش.
-const COLS = ['items', 'followups', 'staff', 'lapsed', 'contacts'];
+const COLS = ['items', 'followups', 'staff', 'lapsed', 'contacts', 'customers'];
 const cleanId = s => String(s).replace(/[\/\\.#$\[\]]/g, '_').slice(0, 480) || '_';
 
 async function connect(cfg) {
@@ -407,7 +436,7 @@ async function storeAll(name) {
 //  وبعد كده بنسحب اللي اتغير بس (updatedAt). ده بيوفّر أكتر من 95% من القراءات
 //  اللي كانت بتعدّي حد Firebase المجاني.
 // ============================================================================
-const CACHE_COLS = ['items', 'followups', 'lapsed', 'contacts'];   // staff صغير: بيتقري كامل
+const CACHE_COLS = ['items', 'followups', 'lapsed', 'contacts', 'customers'];   // staff صغير: بيتقري كامل
 let _idb = null;
 function idbOpen() {
   if (_idb) return _idb;
@@ -415,10 +444,11 @@ function idbOpen() {
   try { pid = JSON.parse(LS.get(CFG_KEY) || '{}').projectId || 'x'; } catch {}
   _idb = new Promise((res, rej) => {
     if (!('indexedDB' in window)) return rej(new Error('no idb'));
-    const r = indexedDB.open('pharma_cache_' + pid, 1);
+    const r = indexedDB.open('pharma_cache_' + pid, 2);
     r.onupgradeneeded = () => {
-      for (const c of CACHE_COLS) r.result.createObjectStore(c, { keyPath: '_id' });
-      r.result.createObjectStore('meta');
+      const d = r.result;
+      for (const c of CACHE_COLS) if (!d.objectStoreNames.contains(c)) d.createObjectStore(c, { keyPath: '_id' });
+      if (!d.objectStoreNames.contains('meta')) d.createObjectStore('meta');
     };
     r.onsuccess = () => res(r.result);
     r.onerror = () => rej(r.error);
@@ -517,7 +547,8 @@ async function loadAll() {
   try {
     lastReads = 0;
     await checkEpoch();
-    const [it, fu, st0, lp, ct] = await Promise.all(COLS.map(syncCol));
+    const [it, fu, st0, lp, ct, cu] = await Promise.all(COLS.map(syncCol));
+    S.customers = cu; S.custMap = new Map(cu.map(c => [c.name, c]));
     const st = st0.filter(x => x._id !== '__epoch__');
     S.items = it; S.followups = fu; S.staff = st; S.lapsed = lp;
     console.log('Firestore reads this load:', lastReads);
@@ -683,7 +714,7 @@ async function uploadSales(file, setProg) {
     if (hasItem && hasCust && !salesRows) salesRows = rows;
     else if (hasCust && hasPhone && !phoneRows) phoneRows = rows;
   }
-  if (!salesRows) throw new Error('لم أجد شيت المبيعات. لازم يكون فيه عمودَي "الصنف" و"اسم العميل".');
+  if (!salesRows && !phoneRows) throw new Error('لم أجد شيت المبيعات ولا شيت الأرقام. لازم يكون فيه "اسم العميل" و"الصنف" أو "اسم العميل" و"رقم التليفون".');
 
   // 1) خريطة الأرقام
   setProg(15, 'جاري تنظيف أرقام الهاتف...');
@@ -697,6 +728,9 @@ async function uploadSales(file, setProg) {
       if (all.length) { phoneOf.set(nm, all[0]); phonesOf.set(nm, all); }
     }
   }
+
+  // ملف أرقام لوحده: بيسجّل العملاء القدام (عشان مايتعاملوش كجدد) ويكمّل الأرقام الناقصة
+  if (!salesRows) return await registerPhonesOnly(phoneOf, phonesOf, setProg);
 
   // 2) جدول الأصناف الحالي (مصدر التصنيف — لا يوجد تخمين في الكود)
   setProg(25, 'جاري مطابقة الأصناف...');
@@ -737,6 +771,7 @@ async function uploadSales(file, setProg) {
   const renamed = [];
   let packFilled = 0;
   const custBuys = new Map();
+  const custFirst = new Map();
 
   function resolveItem(name, code) {
     let meta = null;
@@ -790,6 +825,11 @@ async function uploadSales(file, setProg) {
 
     if (isGenericName(cust)) { skippedGeneric++; continue; }
     seenCustomers.add(cust);
+    if (dt) {
+      const cf = custFirst.get(cust);
+      if (!cf || dt < cf.date) custFirst.set(cust, { date: dt, items: new Set([item]) });
+      else if (dt === cf.date) cf.items.add(item);
+    }
 
     const code = codeOf(r);
     let meta = resolveItem(item, code);
@@ -958,6 +998,36 @@ async function uploadSales(file, setProg) {
     }
   }
 
+  // 5c) سجل العملاء + العملاء الجدد (ترحيب بعد WELCOME_DAYS أيام)
+  const regMap = new Map((S.customers || []).map(c => [c.name, c]));
+  const regEmpty = regMap.size === 0;
+  const knownBefore = new Set([...regMap.keys(), ...S.followups.map(f => f.customerName),
+                               ...S.lapsed.map(x => x.customerName)]);
+  const custRows = [];
+  let newCust = 0;
+  for (const [n, cf] of custFirst) {
+    if (regMap.has(n)) continue;
+    const ph = phoneOf.get(n) || prevPhone.get(n) || '';
+    const row = { _id: n, name: n, firstSeen: regEmpty ? 'seed' : cf.date, phone: ph };
+    if (!regEmpty && !knownBefore.has(n)) {
+      Object.assign(row, { welcomeDue: addDays(cf.date, WELCOME_DAYS), welcomeStatus: 'pending',
+                           firstItems: [...cf.items].slice(0, 6).join(' • ') });
+      newCust++;
+    }
+    custRows.push(row); regMap.set(n, row);
+  }
+  for (const [n, ph] of phoneOf) {
+    if (isGenericName(n)) continue;
+    const c = regMap.get(n);
+    if (!c) { const row = { _id: n, name: n, firstSeen: 'seed', phone: ph }; custRows.push(row); regMap.set(n, row); }
+    else if (!c.phone) { custRows.push({ _id: n, phone: ph }); }
+  }
+  const seedWarn = regEmpty && !phoneRows;
+  if (custRows.length) {
+    setProg(58, `جاري تسجيل ${custRows.length} عميل...`);
+    await writeChunks('customers', custRows, r => r._id, null, 0, 0);
+  }
+
   // 6) الحفظ
   if (convPatches.length) {
     setProg(60, `جاري تسجيل ${convCount} عميل رجع بعد التواصل...`);
@@ -1008,7 +1078,7 @@ async function uploadSales(file, setProg) {
 
   setProg(100, 'تم.');
   return {
-    revived, renamed, packFilled, hasCodes, convCount, convAmount,
+    revived, renamed, packFilled, hasCodes, convCount, convAmount, newCust, seedWarn,
     scanned, saved: rows.length, newItems: newItems.length, cosCount,
     hadPhoneSheet: !!phoneRows,
     noPhone, skippedGeneric,
@@ -1028,7 +1098,7 @@ function viewToday() {
   // صنف اتشال من المزمن = متابعاته القديمة ماتظهرش
   const notChronic = new Set(S.items.filter(i => !i.isChronic).map(i => i.itemName));
   let due = S.followups.filter(f =>
-    (f.kind || 'chronic') === 'chronic' && !notChronic.has(f.itemName) &&
+    (f.kind || 'chronic') === 'chronic' && !notChronic.has(f.itemName) && !blockOf(f.customerName) &&
     f.dueDate <= t && f.status === 'pending' && !f.optedOut && f.phoneValid);
 
   const names = [...new Set(S.followups.map(f => f.assignedTo).filter(Boolean))].sort();
@@ -1050,7 +1120,7 @@ function viewToday() {
   const soonMap = new Map();
   for (const f of S.followups) {
     if ((f.kind || 'chronic') !== 'chronic') continue;
-    if (notChronic.has(f.itemName)) continue;
+    if (notChronic.has(f.itemName) || blockOf(f.customerName)) continue;
     if (f.optedOut || !f.phoneValid) continue;
     if (f.status === 'returned') continue;
     if (!(f.dueDate > t && f.dueDate <= horizon)) continue;
@@ -1092,7 +1162,7 @@ function viewToday() {
 
   // إجماليات بالعملاء مش بالصفوف
   const allDue = S.followups.filter(f =>
-    (f.kind || 'chronic') === 'chronic' && !notChronic.has(f.itemName) &&
+    (f.kind || 'chronic') === 'chronic' && !notChronic.has(f.itemName) && !blockOf(f.customerName) &&
     f.dueDate <= t && f.status === 'pending' && !f.optedOut && f.phoneValid);
   const allCust = new Set(allDue.map(f => f.customerName)).size;
   const doneToday = new Set(S.followups.filter(f =>
@@ -1167,6 +1237,7 @@ function viewToday() {
           <span class="meta">— باقي ${daysBetween(t, m.dueDate)} يوم${
             m.lastQty > 1 ? ' • ' + m.lastQty + ' عبوة' : ''}</span></div>`).join('')}
       </div>` : ''}
+      ${blockSel(g.name)}
       <div class="pick">
         <span class="meta">اللي بيتابع:</span>
         <select data-asg="${gi}">
@@ -1321,7 +1392,7 @@ async function setGroupStatus(gi, patch) {
 function viewCosmetics() {
   const t = todayStr();
   const stage = S.cosStage || 'cos_sat';
-  const ready = f => f.dueDate <= t && f.status === 'pending' && !f.optedOut && f.phoneValid;
+  const ready = f => f.dueDate <= t && f.status === 'pending' && !f.optedOut && f.phoneValid && !blockOf(f.customerName);
   // عمر الشراء نفسه — مش تاريخ الاستحقاق
   const ageOf = f => daysBetween(f.lastPurchaseDate, t);
 
@@ -1390,6 +1461,7 @@ function viewCosmetics() {
         <button class="b no" data-cno="${i}">مردش</button>
       </div>
       <button class="lnk" data-cout="${i}">إيقاف المتابعة</button>
+      ${blockSel(f.customerName)}
     </div>`;
   });
   return h;
@@ -1423,7 +1495,7 @@ async function setCosStatus(i, patch) {
 // ---------- شاشة: عملاء بعُدوا عننا ----------
 // شغل منفصل تمامًا عن المتابعة الدورية — دي حملة استرجاع.
 function viewLapsed() {
-  let list = S.lapsed.filter(x => !x.optedOut);
+  let list = S.lapsed.filter(x => !x.optedOut && !blockOf(x.customerName));
   if (S.lapShow === 'pending')  list = list.filter(x => x.status === 'pending' && x.phoneValid);
   if (S.lapShow === 'done')     list = list.filter(x => x.status && x.status !== 'pending');
   if (S.lapShow === 'nophone')  list = list.filter(x => !x.phoneValid);
@@ -1503,10 +1575,85 @@ function viewLapsed() {
         <button class="b no" data-lno="${i}">مردش</button>
       </div>` : ''}
       <button class="lnk" data-lout="${i}">استبعاد من القايمة</button>
+      ${blockSel(x.customerName)}
     </div>`;
   });
   if (list.length > 120) h += `<p class="meta">أعلى 120 من ${list.length}.</p>`;
   return h;
+}
+
+// ============================================================================
+//  عملاء جدد: رسالة ترحيب بعد WELCOME_DAYS أيام من أول شراء
+// ============================================================================
+function viewWelcome() {
+  const t = todayStr();
+  const all = (S.customers || []).filter(c => c.welcomeStatus && !blockOf(c.name));
+  const show = S.welShow || 'due';
+  let list = show === 'done' ? all.filter(c => c.welcomeStatus !== 'pending')
+           : show === 'nophone' ? all.filter(c => c.welcomeStatus === 'pending' && !c.phone)
+           : all.filter(c => c.welcomeStatus === 'pending' && c.welcomeDue <= t && c.phone);
+  list = [...list].sort((a, b) => (a.welcomeDue || '').localeCompare(b.welcomeDue || ''));
+  const upcoming = all.filter(c => c.welcomeStatus === 'pending' && c.welcomeDue > t).length;
+  const done = all.filter(c => c.welcomeStatus !== 'pending').length;
+  const back = S.contacts.filter(e => e.source === 'welcome' && e.outcome === 'returned').length;
+
+  let h = `<div class="stat">
+    <div><b>${all.filter(c => c.welcomeStatus === 'pending' && c.welcomeDue <= t && c.phone).length}</b><span>مستحقين النهاردة</span></div>
+    <div><b>${upcoming}</b><span>جايين الأيام الجاية</span></div>
+    <div><b>${done}</b><span>اتكلمنا معاهم</span></div>
+    <div><b>${back}</b><span>اشتروا تاني</span></div>
+  </div>`;
+  if (!(S.customers || []).length) {
+    h += `<div class="warn">التطبيق لسه مايعرفش العملاء القدام. ارفع ملف <b>أرقام العملاء</b> مرة واحدة من كارت "ملف المبيعات"
+      في رفع البيانات — عشان العميل القديم مايتعاملش كأنه جديد.</div>`;
+    return h;
+  }
+  h += `<div class="warn">عميل أول مرة يشتري من الصيدلية. بعد ${WELCOME_DAYS} أيام من أول شراء بنطمن عليه —
+    رسالة ودّية مش عرض بيع. لو اشترى تاني خلال 10 أيام من الرسالة، بتتحسب للموظف تلقائي.</div>
+  <div class="fl"><select id="welShow">
+    <option value="due" ${show==='due'?'selected':''}>مستحقين</option>
+    <option value="done" ${show==='done'?'selected':''}>اتعامل معاهم</option>
+    <option value="nophone" ${show==='nophone'?'selected':''}>من غير رقم</option>
+  </select></div>`;
+  if (!list.length) return h + `<div class="empty"><div class="ic">✅</div><p>مفيش حد في الفلتر ده.</p></div>`;
+  S._welList = list;
+  list.slice(0, 150).forEach((c, i) => {
+    const st = c.welcomeStatus === 'contacted' ? '<span class="tag">اتكلمنا</span>'
+             : c.welcomeStatus === 'no_answer' ? '<span class="tag r">مردش</span>' : '';
+    h += `<div class="row">
+      <div class="nm">${esc(c.name)} <span class="tag">أول شراء ${esc(c.firstSeen || '')}</span>${st}</div>
+      <div class="meta phoneline">${c.phone ? `<span class="ph">${esc(c.phone)}</span>
+        <button class="cp" data-cpph="${esc(c.phone)}">نسخ الرقم</button>` : '<span>مفيش رقم — هيظهر بعد رفع ملف الأرقام</span>'}</div>
+      ${c.firstItems ? `<div class="meta">اشترى: ${esc(c.firstItems)}</div>` : ''}
+      ${c.phone && c.welcomeStatus === 'pending' ? `<div class="msgbox">
+        <div class="msghd"><span>الرسالة الجاهزة</span><button class="cp" data-cpwel="${i}">نسخ الرسالة</button></div>
+        <div class="msgtx">${esc(getMsg6().replaceAll('{اسم_العميل}', displayName(c.name)))}</div></div>
+      ${methodToggle()}
+      <div class="acts">
+        <button class="b wa" data-wdone="${i}">تم التواصل</button>
+        <button class="b no" data-wno="${i}">مردش</button>
+      </div>` : ''}
+      ${blockSel(c.name)}
+    </div>`;
+  });
+  if (list.length > 150) h += `<p class="meta">أول 150 من ${list.length}.</p>`;
+  return h;
+}
+
+async function setWelStatus(i, status) {
+  const c = S._welList && S._welList[i];
+  if (!c) return;
+  const who = S.me || '';
+  if (!needStaff(who)) return;
+  const patch = { welcomeStatus: status, welcomeContactedAt: new Date().toISOString(),
+                  contactedBy: who, contactMethod: S.method };
+  Object.assign(c, patch);
+  render();
+  try {
+    await storePut('customers', [{ _id: c.name, ...patch }]);
+    await logContact({ source: 'welcome', outcome: status, staff: who,
+      customerName: c.name, customerPhone: c.phone, itemsText: c.firstItems || '' });
+  } catch (e) { alert('لم يُحفظ: ' + (e.message || e)); loadAll(); }
 }
 
 async function setLapStatus(i, patch) {
@@ -1532,12 +1679,48 @@ async function setLapStatus(i, patch) {
 // كل ضغطة (تم التواصل / اشترى / مردش) بتتسجل كحدث مستقل في "contacts":
 // العميل، رقمه، أصنافه، الوقت، الموظف، وطريقة التواصل.
 const SRC_LABEL = { chronic: 'متابعة دورية', cos_sat: 'استطلاع تجميل',
-  cos_rep: 'إعادة شراء تجميل', lapsed: 'بعُدوا عننا' };
+  cos_rep: 'إعادة شراء تجميل', lapsed: 'بعُدوا عننا', welcome: 'ترحيب عميل جديد' };
+
+// ---- إيقاف العميل: حالة خاصة (نهائي) أو مسافر (لمدة) — بيشيله من كل التابات ----
+const BLOCK_OPTS = [['special', '⛔ حالة خاصة — إيقاف نهائي', 0], ['t30', '✈️ مسافر — شهر', 30],
+                    ['t60', '✈️ مسافر — شهرين', 60], ['t90', '✈️ مسافر — 3 شهور', 90]];
+function blockOf(name) {
+  const c = S.custMap && S.custMap.get(name);
+  if (!c || !c.block) return null;
+  if (c.block === 'travel' && c.blockUntil && c.blockUntil < todayStr()) return null;
+  return c.block;
+}
+function blockSel(name) {
+  return `<select class="blk" data-blk="${esc(name)}" style="margin-top:6px;max-width:260px">
+    <option value="">— إيقاف العميل مؤقتًا أو نهائيًا —</option>
+    ${BLOCK_OPTS.map(([k, l]) => `<option value="${k}">${l}</option>`).join('')}</select>`;
+}
+async function setBlock(name, code) {
+  const opt = BLOCK_OPTS.find(o => o[0] === code);
+  if (!opt) return;
+  if (code === 'special' && !confirm('العميل ده هيتشال من كل القوايم نهائيًا (مزمن، تجميل، بعُدوا، جدد). متأكد؟')) return false;
+  const patch = code === 'special'
+    ? { block: 'special', blockUntil: null }
+    : { block: 'travel', blockUntil: addDays(todayStr(), opt[2]) };
+  Object.assign(patch, { name, blockBy: S.me || '', blockAt: new Date().toISOString() });
+  let c = S.custMap.get(name);
+  if (!c) { c = { _id: name, name }; S.customers.push(c); S.custMap.set(name, c); }
+  Object.assign(c, patch);
+  await storePut('customers', [{ _id: name, ...patch }]);
+  return true;
+}
+async function clearBlock(name) {
+  const c = S.custMap.get(name);
+  if (c) Object.assign(c, { block: null, blockUntil: null });
+  await storePut('customers', [{ _id: name, block: null, blockUntil: null }]);
+}
 const OUT_LABEL = { contacted: 'تم التواصل', returned: 'اشترى / رجع', no_answer: 'مردش' };
 // العميل اللي يشتري خلال المدة دي من التواصل = رجع بسبب التواصل (بيتعرف من رفع المبيعات)
 const CONVERT_DAYS = 10;
 const NORET_REASONS = {
   stopped: 'وقف الدوا / الدكتور غيّره',
+  special: 'حالة خاصة (إيقاف نهائي)',
+  travel: 'مسافر (إيقاف شهر)',
   other_pharmacy: 'بيشتري من صيدلية تانية',
   has_stock: 'لسه معاه دوا',
   unreachable: 'مردش تاني',
@@ -1708,7 +1891,7 @@ function viewLog() {
 // ---- النسخة الاحتياطية: كل المجموعات في ملف واحد، شيت لكل مجموعة ----
 const BACKUP_KEY = 'pharma_last_backup_v1';
 const BACKUP_SHEETS = { followups: 'المتابعات', contacts: 'سجل التواصل', items: 'الأصناف',
-                        lapsed: 'بعدوا عننا', staff: 'الفريق' };
+                        lapsed: 'بعدوا عننا', staff: 'الفريق', customers: 'العملاء' };
 function flatCell(v) {
   if (v === null || v === undefined) return '';
   if (Array.isArray(v)) v = v.map(x => typeof x === 'object' ? JSON.stringify(x) : x).join(' | ');
@@ -1892,6 +2075,17 @@ function viewUpload() {
     <div id="pLap"></div>
   </div>
   <div class="card">
+    <h2>⛔ عملاء موقوفين</h2>
+    ${(() => {
+      const bl = (S.customers || []).filter(c => blockOf(c.name));
+      if (!bl.length) return '<p class="meta">مفيش عملاء موقوفين.</p>';
+      return bl.map(c => `<div class="fl" style="justify-content:space-between;border-bottom:1px solid #eee;padding:6px 0">
+        <span>${esc(c.name)} — ${c.block === 'special' ? 'حالة خاصة' : 'مسافر لحد ' + esc(c.blockUntil)}
+          <span class="meta">(${esc(c.blockBy || '')})</span></span>
+        <button class="cp" data-unblk="${esc(c.name)}">إلغاء الإيقاف</button></div>`).join('');
+    })()}
+  </div>
+  <div class="card">
     <h2>💾 النسخة الاحتياطية</h2>
     <p>بتنزّل كل بيانات التطبيق (المتابعات، سجل التواصل، الأصناف، بعُدوا عننا، الفريق) في ملف إكسل واحد.
       اعملها مرة في الأسبوع واحفظ الملف في مكان آمن (فلاشة أو Google Drive).</p>
@@ -2008,6 +2202,11 @@ function viewItems() {
     <p class="meta">بيتبعت لعملاء تبويب "بعُدوا عننا".</p>
     <textarea id="msgT5">${esc(getMsg5())}</textarea>
     <button class="big" id="bMsg5">حفظ نص الاسترجاع</button>
+
+    <h2 style="margin-top:18px">نص الترحيب بالعميل الجديد</h2>
+    <p class="meta">بيتبعت في تبويب "عملاء جدد" بعد ${WELCOME_DAYS} أيام من أول شراء.</p>
+    <textarea id="msgT6">${esc(getMsg6())}</textarea>
+    <button class="big" id="bMsg6">حفظ نص الترحيب</button>
   </div>
 
   <div class="card">
@@ -2029,13 +2228,15 @@ async function saveItem(name, patch) {
 //  الرسم والأحداث
 // ============================================================================
 function render() {
-  const tabs = [['today','النهاردة'],['cos','التجميل'],['lapsed','بعُدوا عننا'],['log','سجل التواصل'],
+  const nWel = (S.customers || []).filter(c => c.welcomeStatus === 'pending' && c.welcomeDue <= todayStr() && !blockOf(c.name)).length;
+  const tabs = [['today','النهاردة'],['new', 'عملاء جدد' + (nWel ? ' (' + nWel + ')' : '')],['cos','التجميل'],['lapsed','بعُدوا عننا'],['log','سجل التواصل'],
                 ['search','بحث بالصنف'],['upload','رفع البيانات'],['items','الأصناف']];
   let body;
   if (S.loading)   body = `<div class="empty"><div class="ic">⏳</div><p>جاري التحميل...</p></div>`;
   else if (S.tab === 'today')  body = viewToday();
   else if (S.tab === 'cos')    body = viewCosmetics();
   else if (S.tab === 'lapsed') body = viewLapsed();
+  else if (S.tab === 'new')    body = viewWelcome();
   else if (S.tab === 'log')    body = viewLog();
   else if (S.tab === 'search') body = viewSearch();
   else if (S.tab === 'upload') body = viewUpload();
@@ -2134,6 +2335,8 @@ function wire() {
     e.noReturnReason = reason; e.noReturnBy = S.me || '';
     try {
       await storePut('contacts', [{ _id: id, noReturnReason: reason, noReturnBy: e.noReturnBy }]);
+      if (reason === 'special') await setBlock(e.customerName, 'special');
+      if (reason === 'travel') await setBlock(e.customerName, 't30');
       // وقف الدوا: نوقف متابعة الأصناف دي للعميل ده
       if (reason === 'stopped') {
         const items = new Set(e.items || []);
@@ -2257,6 +2460,29 @@ function wire() {
   if (bMsg5) bMsg5.addEventListener('click', () => {
     saveMsg5(document.getElementById('msgT5').value); alert('اتحفظ.');
   });
+  const bMsg6 = document.getElementById('bMsg6');
+  if (bMsg6) bMsg6.addEventListener('click', () => {
+    saveMsg6(document.getElementById('msgT6').value); alert('اتحفظ.');
+  });
+  const welShow = document.getElementById('welShow');
+  if (welShow) welShow.addEventListener('change', e => { S.welShow = e.target.value; render(); });
+  on('[data-wdone]', 'click', e => setWelStatus(+e.currentTarget.dataset.wdone, 'contacted'));
+  on('[data-wno]', 'click', e => setWelStatus(+e.currentTarget.dataset.wno, 'no_answer'));
+  on('[data-cpwel]', 'click', e => {
+    const c = S._welList[+e.currentTarget.dataset.cpwel];
+    if (c) copyText(getMsg6().replaceAll('{اسم_العميل}', displayName(c.name)), e.currentTarget);
+  });
+  document.querySelectorAll('[data-blk]').forEach(el => el.addEventListener('change', async ev => {
+    const name = ev.target.dataset.blk, code = ev.target.value;
+    if (!code) return;
+    try { const ok = await setBlock(name, code); if (ok === false) ev.target.value = ''; }
+    catch (err) { alert('لم يُحفظ: ' + (err.message || err)); }
+    render();
+  }));
+  on('[data-unblk]', 'click', async e => {
+    try { await clearBlock(e.currentTarget.dataset.unblk); } catch (err) { alert('لم يُحفظ: ' + (err.message || err)); }
+    render();
+  });
   const bReset = document.getElementById('bReset');
   if (bReset) bReset.addEventListener('click', async () => {
     if (!confirm('⚠️ ده هيمسح البيانات من السحابة، يعني هتتمسح عند كل الفريق. متأكد؟')) return;
@@ -2312,13 +2538,20 @@ function wire() {
     try {
       const r = await uploadSales(f, p);
       await loadAll();
+      if (r.phonesOnly) {
+        document.getElementById('pSales').innerHTML = `<div class="good">تم رفع ملف الأرقام ✅
+• ${r.registered} عميل اتسجل أو اتحدث رقمه
+• ${r.fixed} متابعة كانت من غير رقم واتكمّل رقمها</div>`;
+        bSales.disabled = false;
+        return;
+      }
       document.getElementById('pSales').innerHTML = `<div class="good">تم.
 • ${r.customers} عميل
 • ${r.saved} متابعة اتسجلت (منها ${r.cosCount} تجميل)
 • ${r.newItems} صنف جديد محتاج مراجعة
 • ${r.noPhone} متابعة من غير رقم صالح (مش هتظهر في القايمة)
 • ${r.skippedGeneric} سطر اتستبعد (أسماء عامة زي "عميل زائر")
-${r.convCount ? '🎯 ' + r.convCount + ' عميل اشترى خلال ' + CONVERT_DAYS + ' أيام من التواصل (' + r.convAmount.toLocaleString('en') + ' ج) — اتحسبوا للموظفين في سجل التواصل\n' : ''}${r.packFilled ? '• ' + r.packFilled + ' صنف مزمن اتكمّل عدد أقراصه من الاسم الجديد (الجرعة افتراضي قرص/يوم — راجعها في تاب الأصناف)\n' : ''}${r.hasCodes ? '' : '\n⚠ الملف مفيهوش عمود "كود الصنف" — الأصناف اتربطت بالاسم بس. صدّر المبيعات بعمود الكود.'}${r.renamed.length ? '\n\n🔁 ' + r.renamed.length + ' صنف اسمه اتغير في الكاشير واتربط بالقديم:\n' + r.renamed.map(x => '• ' + esc(x.from) + '  ←  ' + esc(x.to)).join('\n') : ''}
+${r.newCust ? '🌱 ' + r.newCust + ' عميل جديد — هيظهروا في تبويب "عملاء جدد" بعد ' + WELCOME_DAYS + ' أيام من أول شراء\n' : ''}${r.seedWarn ? '⚠ التطبيق لسه مايعرفش العملاء القدام، فمفيش ترحيب اتعمل المرة دي. ارفع ملف أرقام العملاء مرة واحدة.\n' : ''}${r.convCount ? '🎯 ' + r.convCount + ' عميل اشترى خلال ' + CONVERT_DAYS + ' أيام من التواصل (' + r.convAmount.toLocaleString('en') + ' ج) — اتحسبوا للموظفين في سجل التواصل\n' : ''}${r.packFilled ? '• ' + r.packFilled + ' صنف مزمن اتكمّل عدد أقراصه من الاسم الجديد (الجرعة افتراضي قرص/يوم — راجعها في تاب الأصناف)\n' : ''}${r.hasCodes ? '' : '\n⚠ الملف مفيهوش عمود "كود الصنف" — الأصناف اتربطت بالاسم بس. صدّر المبيعات بعمود الكود.'}${r.renamed.length ? '\n\n🔁 ' + r.renamed.length + ' صنف اسمه اتغير في الكاشير واتربط بالقديم:\n' + r.renamed.map(x => '• ' + esc(x.from) + '  ←  ' + esc(x.to)).join('\n') : ''}
 ${r.revived ? '\n✅ ' + r.revived + ' عميل من قايمة "بعُدوا عننا" رجعوا اشتروا — اتشالوا من القايمة تلقائيًا.' : ''}${r.hadPhoneSheet ? '' : '\n⚠ الملف ده مفيهوش شيت أرقام — استخدمنا الأرقام المحفوظة من قبل. العملاء الجدد اللي ظهروا لأول مرة هيبقوا من غير رقم لحد ما ترفع ملف فيه الأرقام.'}</div>`;
     } catch (e) {
       document.getElementById('pSales').innerHTML = `<div class="err">${esc(e.message || e)}</div>`;
