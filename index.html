@@ -178,7 +178,8 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
 // نسخة الفريق — البيانات على Firestore، فكل الموظفين بيشوفوا نفس القايمة لحظيًا.
 // لازم تفتح من لينك (https) — مش من ملف على الجهاز، لأن Firebase بيرفض file://
 import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js';
-import { getFirestore, collection, doc, getDocs, setDoc, updateDoc, writeBatch, deleteDoc }
+import { getFirestore, collection, doc, getDocs, getDoc, setDoc, updateDoc, writeBatch, deleteDoc,
+         query, where, serverTimestamp, Timestamp }
   from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js';
 import { getAuth, signInAnonymously } from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js';
 
@@ -401,27 +402,125 @@ async function storeAll(name) {
   return snap.docs.map(d => ({ _id: d.id, ...d.data() }));
 }
 
+// ============================================================================
+//  ذاكرة على الجهاز (IndexedDB): أول فتح بيقرا كل حاجة مرة واحدة،
+//  وبعد كده بنسحب اللي اتغير بس (updatedAt). ده بيوفّر أكتر من 95% من القراءات
+//  اللي كانت بتعدّي حد Firebase المجاني.
+// ============================================================================
+const CACHE_COLS = ['items', 'followups', 'lapsed', 'contacts'];   // staff صغير: بيتقري كامل
+let _idb = null;
+function idbOpen() {
+  if (_idb) return _idb;
+  let pid = 'x';
+  try { pid = JSON.parse(LS.get(CFG_KEY) || '{}').projectId || 'x'; } catch {}
+  _idb = new Promise((res, rej) => {
+    if (!('indexedDB' in window)) return rej(new Error('no idb'));
+    const r = indexedDB.open('pharma_cache_' + pid, 1);
+    r.onupgradeneeded = () => {
+      for (const c of CACHE_COLS) r.result.createObjectStore(c, { keyPath: '_id' });
+      r.result.createObjectStore('meta');
+    };
+    r.onsuccess = () => res(r.result);
+    r.onerror = () => rej(r.error);
+  });
+  return _idb;
+}
+function idbReq(req) { return new Promise((res, rej) => { req.onsuccess = () => res(req.result); req.onerror = () => rej(req.error); }); }
+async function idbAll(store) { const d = await idbOpen(); return idbReq(d.transaction(store).objectStore(store).getAll()); }
+async function idbGet(store, key) { const d = await idbOpen(); return idbReq(d.transaction(store).objectStore(store).get(key)); }
+async function idbPutMany(store, rows) {
+  const d = await idbOpen();
+  await new Promise((res, rej) => {
+    const t = d.transaction(store, 'readwrite'); const os = t.objectStore(store);
+    for (const r of rows) os.put(r);
+    t.oncomplete = res; t.onerror = () => rej(t.error);
+  });
+}
+async function idbSetMeta(key, val) {
+  const d = await idbOpen();
+  await new Promise((res, rej) => {
+    const t = d.transaction('meta', 'readwrite'); t.objectStore('meta').put(val, key);
+    t.oncomplete = res; t.onerror = () => rej(t.error);
+  });
+}
+async function idbClear() {
+  const d = await idbOpen();
+  await new Promise((res, rej) => {
+    const t = d.transaction([...CACHE_COLS, 'meta'], 'readwrite');
+    for (const c of [...CACHE_COLS, 'meta']) t.objectStore(c).clear();
+    t.oncomplete = res; t.onerror = () => rej(t.error);
+  });
+}
+// الـ Timestamp مايتخزنش في IndexedDB — بنحوّله لرقم
+function plainDoc(d) {
+  const o = { _id: d.id, ...d.data() };
+  o._ts = o.updatedAt && o.updatedAt.toMillis ? o.updatedAt.toMillis() : 0;
+  delete o.updatedAt;
+  return o;
+}
+let lastReads = 0;
+async function syncCol(name) {
+  if (!CACHE_COLS.includes(name)) { const r = await storeAll(name); lastReads += r.length; return r; }
+  try {
+    let meta = await idbGet('meta', name);
+    // مرة في الأسبوع بنعيد القراءة كاملة — بتصلّح أي فرق (زي تعديلات من نسخة قديمة من التطبيق)
+    const full = !meta || !meta.fullAt || Date.now() - meta.fullAt > 7 * 86400000;
+    let snap;
+    if (full) snap = await getDocs(collection(db, name));
+    else snap = await getDocs(query(collection(db, name),
+                  where('updatedAt', '>=', Timestamp.fromMillis(meta.lastSync))));
+    const changed = snap.docs.map(plainDoc);
+    lastReads += changed.length;
+    if (full) {                                   // القراءة الكاملة بتستبدل الذاكرة
+      const d = await idbOpen();
+      await new Promise((res, rej) => { const t = d.transaction(name, 'readwrite');
+        t.objectStore(name).clear(); t.oncomplete = res; t.onerror = () => rej(t.error); });
+    }
+    if (changed.length) await idbPutMany(name, changed);
+    const maxTs = Math.max(full ? 0 : meta.lastSync, ...changed.map(x => x._ts));
+    await idbSetMeta(name, { lastSync: maxTs, fullAt: full ? Date.now() : meta.fullAt });
+    return await idbAll(name);
+  } catch (e) {
+    console.warn('cache fallback', name, e);
+    const r = await storeAll(name); lastReads += r.length; return r;
+  }
+}
+// لو حد مسح كل البيانات من جهاز تاني، باقي الأجهزة لازم ترمي الذاكرة بتاعتها
+async function checkEpoch() {
+  try {
+    const snap = await getDoc(doc(db, 'staff', '__epoch__'));
+    const remote = snap.exists() ? snap.data().value : 0;
+    const local = await idbGet('meta', '__epoch__');
+    if (local !== undefined && local !== remote) await idbClear();
+    await idbSetMeta('__epoch__', remote);
+  } catch (e) { console.warn('epoch check skipped', e); }
+}
+
 async function storePut(name, rows) {
   const SIZE = 400;                       // حد Firestore 500 عملية للدفعة
   for (let i = 0; i < rows.length; i += SIZE) {
     const b = writeBatch(db);
     for (const r of rows.slice(i, i + SIZE)) {
-      const { _id, ...data } = r;
-      b.set(doc(db, name, cleanId(_id)), data, { merge: true });
+      const { _id, _ts, ...data } = r;
+      b.set(doc(db, name, cleanId(_id)), { ...data, updatedAt: serverTimestamp() }, { merge: true });
     }
     await b.commit();
   }
 }
 
 async function storePatch(name, id, patch) {
-  await setDoc(doc(db, name, cleanId(id)), patch, { merge: true });
+  await setDoc(doc(db, name, cleanId(id)), { ...patch, updatedAt: serverTimestamp() }, { merge: true });
 }
 
 async function loadAll() {
   S.loading = true; render();
   try {
-    const [it, fu, st, lp, ct] = await Promise.all(COLS.map(storeAll));
+    lastReads = 0;
+    await checkEpoch();
+    const [it, fu, st0, lp, ct] = await Promise.all(COLS.map(syncCol));
+    const st = st0.filter(x => x._id !== '__epoch__');
     S.items = it; S.followups = fu; S.staff = st; S.lapsed = lp;
+    console.log('Firestore reads this load:', lastReads);
     S.contacts = ct.sort((a, b) => (b.at || '').localeCompare(a.at || ''));
     S.err = '';
   } catch (e) {
@@ -1625,7 +1724,7 @@ async function exportBackup(setProg) {
   for (let k = 0; k < names.length; k++) {
     const col = names[k];
     setProg(10 + k * 17, 'جاري تحميل ' + BACKUP_SHEETS[col] + '...');
-    const docs = await storeAll(col);           // من قاعدة البيانات مباشرة، مش من الشاشة
+    const docs = (await storeAll(col)).filter(d => d._id !== '__epoch__');   // من قاعدة البيانات مباشرة
     const keys = ['_id', ...new Set(docs.flatMap(d => Object.keys(d)).filter(x => x !== '_id'))];
     const aoa = [keys, ...docs.map(d => keys.map(x => flatCell(d[x])))];
     X.utils.book_append_sheet(wb, X.utils.aoa_to_sheet(aoa), BACKUP_SHEETS[col]);
@@ -1799,6 +1898,8 @@ function viewUpload() {
     <button class="big" id="bBackup">تنزيل نسخة احتياطية</button>
     <div id="pBackup"></div>
     <p class="meta" style="margin-top:8px">${lastBk ? 'آخر نسخة من الجهاز ده: ' + esc(fmtTime(lastBk)) : 'مفيش نسخة سابقة من الجهاز ده.'}</p>
+    <p class="meta" style="margin-top:12px">لو حاسس إن الجهاز ده مش شايف تعديلات زمايلك:
+      <button class="cp" id="bFullSync">🔄 تحديث كامل للبيانات</button></p>
   </div>
   <div class="card">
     <h2>الفريق</h2>
@@ -2084,6 +2185,12 @@ function wire() {
   on('[data-dph]', 'click', e => copyText(e.currentTarget.dataset.dph, e.currentTarget));
 
   // --- الأصناف ---
+  const bFullSync = document.getElementById('bFullSync');
+  if (bFullSync) bFullSync.addEventListener('click', async () => {
+    try { await idbClear(); } catch (e) {}
+    await loadAll();
+    alert('تم تحديث كل البيانات من السحابة ✅');
+  });
   const bBackup = document.getElementById('bBackup');
   if (bBackup) bBackup.addEventListener('click', async () => {
     bBackup.disabled = true;
@@ -2164,6 +2271,8 @@ function wire() {
           await b.commit();
         }
       }
+      await setDoc(doc(db, 'staff', '__epoch__'), { value: Date.now() });
+      try { await idbClear(); } catch (e) {}
       location.reload();
     } catch (e) { alert('فشل المسح: ' + (e.message || e)); }
   });
