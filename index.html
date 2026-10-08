@@ -304,6 +304,19 @@ function calcCycle(units, dose, fallback) {
 async function registerPhonesOnly(phoneOf, phonesOf, setProg) {
   setProg(40, 'جاري تسجيل العملاء...');
   const regMap = new Map((S.customers || []).map(c => [c.name, c]));
+  // الاسم في ملف الأرقام ممكن يختلف شوية عن المبيعات ("*علاء" / "علاء"، "الصاوى" / "الصاوي").
+  // لو مفيش تطابق بالظبط، بنربط بالاسم المشابه — بشرط إنه يطابق اسم واحد بس في الملف.
+  const byKey = new Map();
+  for (const n of phoneOf.keys()) {
+    const k = nameKey(n);
+    if (k.length < 3) continue;
+    byKey.set(k, byKey.has(k) ? null : n);          // null = أكتر من اسم بنفس المفتاح، مانربطش
+  }
+  let similar = 0;
+  const lookup = name => {
+    if (phoneOf.has(name)) return name;
+    return byKey.get(nameKey(name)) || null;
+  };
   const rows = [];
   for (const [n, ph] of phoneOf) {
     if (isGenericName(n)) continue;
@@ -311,14 +324,25 @@ async function registerPhonesOnly(phoneOf, phonesOf, setProg) {
     if (!c) rows.push({ _id: n, name: n, firstSeen: 'seed', phone: ph });
     else if (c.phone !== ph) rows.push({ _id: n, phone: ph });
   }
+  for (const c of S.customers || []) {
+    if (c.phone || phoneOf.has(c.name)) continue;
+    const m = lookup(c.name);
+    if (m) { rows.push({ _id: c._id || c.name, phone: phoneOf.get(m) }); similar++; }
+  }
   if (rows.length) await writeChunks('customers', rows, r => r._id, setProg, 40, 75);
   // نكمّل الأرقام الناقصة في المتابعات
-  const fix = S.followups.filter(f => !f.phoneValid && phoneOf.get(f.customerName))
-    .map(f => ({ _id: f._id, customerPhone: phoneOf.get(f.customerName),
-                 phonesExtra: (phonesOf.get(f.customerName) || []).slice(1), phoneValid: true }));
+  const fix = [];
+  for (const f of S.followups) {
+    if (f.phoneValid) continue;
+    const m = lookup(f.customerName);
+    if (m) fix.push({ _id: f._id, customerPhone: phoneOf.get(m),
+                      phonesExtra: (phonesOf.get(m) || []).slice(1), phoneValid: true });
+  }
   if (fix.length) { setProg(80, `جاري إضافة أرقام لـ ${fix.length} متابعة...`); await storePut('followups', fix); }
+  const got = new Set(rows.filter(r => r.phone).map(r => r._id));
+  const stillNo = (S.customers || []).filter(c => c.welcomeStatus === 'pending' && !c.phone && !got.has(c._id || c.name)).length;
   setProg(100, 'تم.');
-  return { phonesOnly: true, registered: rows.length, fixed: fix.length };
+  return { phonesOnly: true, registered: rows.length, fixed: fix.length, withPhone: phoneOf.size, similar, stillNo };
 }
 
 // ---- ربط الأصناف بالكود ----
@@ -354,7 +378,11 @@ function addDays(dateStr, n) {
 function normalizePhones(raw) {
   const out = [];
   if (raw === null || raw === undefined) return out;
-  for (const p of String(raw).split('-')) {
+  // الأرقام ممكن تكون مفصولة بـ - أو / أو فاصلة أو سطر جديد أو مسافة.
+  // بنجرب كل جزء كامل (عشان "010 1234 5678")، وبعدين كل رقم متصل لوحده.
+  const s = String(raw).replace(/[٠-٩]/g, c => '٠١٢٣٤٥٦٧٨٩'.indexOf(c)).replace(/\+?2(?=01[0125]\d{8})/g, '');
+  const parts = [...s.split(/[-\/,;|\n،]+/), ...(s.match(/\d+/g) || [])];
+  for (const p of parts) {
     let d = p.replace(/\D/g, '');
     if (d.length === 10 && d[0] !== '0') d = '0' + d;
     if (/^01[0125]\d{8}$/.test(d) && !out.includes(d)) out.push(d);
@@ -702,6 +730,27 @@ async function uploadLapsed(file, setProg) {
   return { count: out.length, withPhone: out.filter(x => x.phoneValid).length };
 }
 
+// عمود اسم العميل في شيت الأرقام
+function custColOf(keys) {
+  const names = ['اسم العميل', 'أسم العميل', 'إسم العميل', 'العميل', 'الاسم', 'الإسم', 'اسم'];
+  for (const n of names) { const k = keys.find(x => String(x).trim() === n); if (k !== undefined) return k; }
+  return null;
+}
+// عمود الرقم: مش لازم اسمه يكون مظبوط — بناخد العمود اللي فيه أكتر أرقام موبايل صالحة
+function phoneColOf(rows, keys) {
+  const nk = custColOf(keys);
+  const named = k => /تليفون|تلفون|هاتف|موبايل|محمول|جوال|phone|mobile/i.test(String(k));
+  let best = null, bestN = 0;
+  for (const k of keys) {
+    if (k === nk) continue;
+    let n = 0;
+    for (const r of rows.slice(0, 300)) if (normalizePhones(r[k]).length) n++;
+    if (n && named(k)) return k;                 // عمود اسمه تليفون وفيه أرقام = هو ده
+    if (n > bestN) { best = k; bestN = n; }
+  }
+  return best;
+}
+
 // --- رفع ملف المبيعات: الخطوة الأساسية ---
 async function uploadSales(file, setProg) {
   const X = await ensureXlsx();
@@ -716,27 +765,32 @@ async function uploadSales(file, setProg) {
     const keys = Object.keys(rows[0]).map(k => String(k).trim());
     const hasItem = keys.some(k => ['الصنف', 'اسم الصنف'].includes(k));
     const hasCust = keys.some(k => ['اسم العميل', 'أسم العميل'].includes(k));
-    const hasPhone = keys.some(k => k.includes('تليفون') || k.includes('هاتف') || k.includes('رقم'));
     if (hasItem && hasCust && !salesRows) salesRows = rows;
-    else if (hasCust && hasPhone && !phoneRows) phoneRows = rows;
+    else if (!phoneRows && custColOf(keys) && phoneColOf(rows, keys)) phoneRows = rows;
   }
-  if (!salesRows && !phoneRows) throw new Error('لم أجد شيت المبيعات ولا شيت الأرقام. لازم يكون فيه "اسم العميل" و"الصنف" أو "اسم العميل" و"رقم التليفون".');
+  // ملف الكاشير ممكن يبقى شيت واحد: المبيعات وفيها عمود "رقم التليفون" — ناخد الأرقام منه
+  if (salesRows && !phoneRows && phoneColOf(salesRows, Object.keys(salesRows[0]))) phoneRows = salesRows;
+  if (!salesRows && !phoneRows) throw new Error('لم أجد شيت المبيعات ولا شيت الأرقام. لازم يكون فيه "اسم العميل" و"الصنف" أو "اسم العميل" وعمود فيه أرقام موبايل.');
 
   // 1) خريطة الأرقام
   setProg(15, 'جاري تنظيف أرقام الهاتف...');
   const phoneOf = new Map();    // الاسم -> الرقم الأساسي
   const phonesOf = new Map();   // الاسم -> كل الأرقام
+  let phoneFileRows = 0;
   if (phoneRows) {
+    const keys = Object.keys(phoneRows[0]);
+    const nk = custColOf(keys), pk = phoneColOf(phoneRows, keys);
     for (const r of phoneRows) {
-      const nm = String(pick(r, ['أسم العميل', 'اسم العميل']) ?? '').trim();
+      const nm = String(r[nk] ?? '').trim();
       if (!nm) continue;
-      const all = normalizePhones(pick(r, ['ارقام التليفون', 'أرقام التليفون', 'رقم الهاتف', 'التليفون']));
+      phoneFileRows++;
+      const all = normalizePhones(r[pk]);
       if (all.length) { phoneOf.set(nm, all[0]); phonesOf.set(nm, all); }
     }
   }
 
   // ملف أرقام لوحده: بيسجّل العملاء القدام (عشان مايتعاملوش كجدد) ويكمّل الأرقام الناقصة
-  if (!salesRows) return await registerPhonesOnly(phoneOf, phonesOf, setProg);
+  if (!salesRows) return { ...(await registerPhonesOnly(phoneOf, phonesOf, setProg)), phoneFileRows };
 
   // 2) جدول الأصناف الحالي (مصدر التصنيف — لا يوجد تخمين في الكود)
   setProg(25, 'جاري مطابقة الأصناف...');
@@ -2672,9 +2726,12 @@ function wire() {
             customers: r.customers, newItems: r.newItems, newCust: r.newCust || 0 });
       await loadAll();
       if (r.phonesOnly) {
-        document.getElementById('pSales').innerHTML = `<div class="good">تم رفع ملف الأرقام ✅
-• ${r.registered} عميل اتسجل أو اتحدث رقمه
-• ${r.fixed} متابعة كانت من غير رقم واتكمّل رقمها</div>`;
+        document.getElementById('pSales').innerHTML = `<div class="${r.withPhone ? 'good' : 'err'}">تم رفع ملف الأرقام ${r.withPhone ? '✅' : '⚠'}
+• ${r.phoneFileRows} اسم في الملف، منهم ${r.withPhone} برقم موبايل صالح
+• ${r.registered} عميل اتسجل أو اتحدث رقمه${r.similar ? ' (منهم ' + r.similar + ' بالاسم المشابه)' : ''}
+• ${r.fixed} متابعة كانت من غير رقم واتكمّل رقمها
+${r.stillNo ? '• ' + r.stillNo + ' عميل جديد لسه من غير رقم — اسمهم مش موجود في الملف' : '• كل العملاء الجداد بقى ليهم رقم 👌'}
+${r.withPhone ? '' : '\n⚠ مالقيتش ولا رقم موبايل صالح في الملف. اتأكد إن فيه عمود أرقام بتبدأ بـ 01.'}</div>`;
         bSales.disabled = false;
         return;
       }
