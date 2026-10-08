@@ -54,6 +54,9 @@
   .ph2{direction:ltr;color:var(--mut);font-size:13px}
   .tag.src{background:#eef1f4;color:#4a5560}
   .logmeta{display:flex;gap:14px;flex-wrap:wrap;margin-top:6px}
+  .logtbl td{vertical-align:top}
+  .logtbl .dayrow td{background:#f1f5f3;font-weight:700;color:var(--g2)}
+  .clip{max-width:260px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .items{margin-top:8px;font-size:13px}
   .items summary{cursor:pointer;color:var(--g2);font-weight:600}
   .itemstx{padding:8px;background:#f7f9fa;border-radius:8px;margin-top:6px;
@@ -275,7 +278,8 @@ let S = {
   logMethod: 'all',
   logOutcome: 'all',
   showReasoned: false,
-  logPeriod: '30'
+  logPeriod: '30',
+  uploads: []      // سجل الرفع: إمتى، مين، والفترة اللي في الملف
 };
 
 const el = document.getElementById('app');
@@ -553,6 +557,8 @@ async function loadAll() {
     S.items = it; S.followups = fu; S.staff = st; S.lapsed = lp;
     console.log('Firestore reads this load:', lastReads);
     S.contacts = ct.sort((a, b) => (b.at || '').localeCompare(a.at || ''));
+    try { S.uploads = (await storeAll('uploads')).sort((a, b) => (b.at || '').localeCompare(a.at || '')); }
+    catch (e) { console.warn('uploads log', e); S.uploads = []; }
     S.err = '';
   } catch (e) {
     S.err = 'تعذّر تحميل البيانات من Firebase:\n' + (e.message || e) +
@@ -815,6 +821,7 @@ async function uploadSales(file, setProg) {
   const cosPairs = new Map();   // منتجات التجميل فوق الحد السعري
   const seenCustomers = new Set();
   let skippedGeneric = 0, noPhone = 0, scanned = 0;
+  let dateFrom = null, dateTo = null;    // الفترة اللي في الملف — بتتسجل في "حالة الرفع"
 
   for (const r of salesRows) {
     const item = String(pick(r, ['الصنف', 'اسم الصنف']) ?? '').trim();
@@ -822,6 +829,10 @@ async function uploadSales(file, setProg) {
     const dt   = toDateStr(pick(r, ['التاريخ', 'تاريخ']));
     if (!item || !cust) continue;
     scanned++;
+    if (dt) {
+      if (!dateFrom || dt < dateFrom) dateFrom = dt;
+      if (!dateTo || dt > dateTo) dateTo = dt;
+    }
 
     if (isGenericName(cust)) { skippedGeneric++; continue; }
     seenCustomers.add(cust);
@@ -1078,6 +1089,7 @@ async function uploadSales(file, setProg) {
 
   setProg(100, 'تم.');
   return {
+    dateFrom, dateTo,
     revived, renamed, packFilled, hasCodes, convCount, convAmount, newCust, seedWarn,
     scanned, saved: rows.length, newItems: newItems.length, cosCount,
     hadPhoneSheet: !!phoneRows,
@@ -1324,6 +1336,20 @@ function fmtTime(iso) {
   const p = n => String(n).padStart(2, '0');
   let h = d.getHours(); const ap = h < 12 ? 'ص' : 'م'; h = h % 12 || 12;
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}  ${h}:${p(d.getMinutes())} ${ap}`;
+}
+
+// اليوم بتوقيت الجهاز (YYYY-MM-DD) والساعة لوحدها — لجدول سجل التواصل
+function localDay(iso) {
+  const d = new Date(iso);
+  if (!iso || isNaN(d)) return '';
+  const p = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+function fmtClock(iso) {
+  const d = new Date(iso);
+  if (!iso || isNaN(d)) return '';
+  let h = d.getHours(); const ap = h < 12 ? 'ص' : 'م'; h = h % 12 || 12;
+  return `${h}:${String(d.getMinutes()).padStart(2, '0')} ${ap}`;
 }
 
 const METHOD_LABEL = { whatsapp: 'واتساب', phone: 'تليفون' };
@@ -1857,34 +1883,42 @@ function viewLog() {
     return h;
   }
 
-  list.slice(0, 300).forEach(e => {
+  // جدول: صف لكل تواصل، متقسم بالأيام — اليوم، الساعة، الموظف، العميل ورقمه، الطريقة، النتيجة
+  const shown = list.slice(0, 500);
+  const noret = S.logOutcome === 'noret';
+  const cols = noret ? 7 : 6;
+  let rows = '', lastDay = '';
+  shown.forEach(e => {
+    const day = localDay(e.at);
+    if (day !== lastDay) {
+      const n = shown.filter(x => localDay(x.at) === day).length;
+      rows += `<tr class="dayrow"><td colspan="${cols}">📅 ${esc(fmtDay(day))} <span class="meta">— ${n} تواصل</span></td></tr>`;
+      lastDay = day;
+    }
     const oc = e.outcome === 'returned' ? 'ok' : e.outcome === 'no_answer' ? 'r' : '';
     const items = itemsOf(e);
-    h += `<div class="row">
-      <div class="nm">${esc(e.customerName)}
-        <span class="tag ${oc}">${OUT_LABEL[e.outcome] || e.outcome}</span>
-        <span class="tag src">${SRC_LABEL[e.source] || ''}</span></div>
-      ${e.customerPhone ? `<div class="meta phoneline"><span class="ph">${esc(e.customerPhone)}</span>
-        <button class="cp" data-cpph="${esc(e.customerPhone)}">نسخ الرقم</button></div>` : ''}
-      ${items ? (items.length > 160
-        ? `<details class="items"><summary>الأصناف</summary><div class="itemstx">${esc(items)}</div></details>`
-        : `<div class="med">💊 ${esc(items)}</div>`) : ''}
-      <div class="meta logmeta">
-        <span>🕒 ${esc(fmtTime(e.at))}</span>
-        <span>👤 ${esc(e.staff || 'غير محدد')}</span>
-        ${e.convertedOn ? `<span>🎯 اشترى ${esc(e.convertedOn)}${e.convertedAmount ? ' • ' + e.convertedAmount.toLocaleString('en') + ' ج' : ''}${e.autoConverted ? ' (من المبيعات)' : ''}</span>` : ''}
-        <span>${e.method === 'phone' ? '📞 تليفون' : e.method === 'whatsapp' ? '💬 واتساب'
-          : '— (قبل تسجيل طريقة التواصل)'}</span>
-      </div>
-      ${isNoReturn(e) ? `<div class="fl" style="margin-top:6px">
-        <select data-nr="${esc(e._id)}">
+    rows += `<tr>
+      <td style="white-space:nowrap">${esc(fmtClock(e.at))}</td>
+      <td>${esc(e.staff || 'غير محدد')}</td>
+      <td><b>${esc(e.customerName)}</b>
+        ${items ? `<div class="meta clip" title="${esc(items)}">💊 ${esc(items)}</div>` : ''}
+        <div class="meta">${esc(SRC_LABEL[e.source] || '')}</div></td>
+      <td style="white-space:nowrap">${e.customerPhone ? `<span class="ph">${esc(e.customerPhone)}</span>
+        <button class="cp" data-cpph="${esc(e.customerPhone)}">نسخ</button>` : '—'}</td>
+      <td style="white-space:nowrap">${e.method === 'phone' ? '📞 تليفون' : e.method === 'whatsapp' ? '💬 واتساب' : '—'}</td>
+      <td><span class="tag ${oc}" style="margin:0">${OUT_LABEL[e.outcome] || e.outcome}</span>
+        ${e.convertedOn ? `<div class="meta">🎯 اشترى ${esc(e.convertedOn)}${e.convertedAmount ? ' • ' + e.convertedAmount.toLocaleString('en') + ' ج' : ''}</div>` : ''}</td>
+      ${noret ? `<td>${isNoReturn(e) ? `<select data-nr="${esc(e._id)}">
           <option value="">— مرجعش ليه؟ —</option>
           ${Object.entries(NORET_REASONS).map(([k, v]) =>
             `<option value="${k}" ${e.noReturnReason === k ? 'selected' : ''}>${v}</option>`).join('')}
-        </select></div>` : ''}
-    </div>`;
+        </select>` : ''}</td>` : ''}
+    </tr>`;
   });
-  if (list.length > 300) h += `<p class="meta">أحدث 300 من ${list.length} — التصدير فيه الكل.</p>`;
+  h += `<div class="scroll logtbl" style="max-height:75vh"><table><thead><tr>
+    <th>الساعة</th><th>الموظف</th><th>العميل</th><th>الرقم</th><th>الطريقة</th><th>النتيجة</th>${noret ? '<th>السبب</th>' : ''}
+    </tr></thead><tbody>${rows}</tbody></table></div>`;
+  if (list.length > 500) h += `<p class="meta">أحدث 500 من ${list.length} — التصدير فيه الكل.</p>`;
   return h;
 }
 
@@ -1939,12 +1973,12 @@ async function exportLog() {
   const X = await ensureXlsx();
   const { list } = logFiltered();
   const rows = list.map(e => ({
-    'الوقت': fmtTime(e.at), 'الموظف': e.staff || '', 'اسم العميل': e.customerName,
+    'اليوم': localDay(e.at), 'الساعة': fmtClock(e.at), 'الموظف': e.staff || '', 'اسم العميل': e.customerName,
     'رقم الهاتف': e.customerPhone || '', 'طريقة التواصل': METHOD_LABEL[e.method] || '—',
     'النتيجة': OUT_LABEL[e.outcome] || e.outcome, 'نوع المتابعة': SRC_LABEL[e.source] || '',
     'الأصناف': itemsOf(e) }));
   const ws = X.utils.json_to_sheet(rows);
-  ws['!cols'] = [{wch:20},{wch:16},{wch:28},{wch:14},{wch:12},{wch:12},{wch:16},{wch:80}];
+  ws['!cols'] = [{wch:12},{wch:10},{wch:16},{wch:28},{wch:14},{wch:12},{wch:12},{wch:16},{wch:80}];
   const wb = X.utils.book_new();
   X.utils.book_append_sheet(wb, ws, 'سجل التواصل');
   X.writeFile(wb, 'سجل_التواصل_' + todayStr() + '.xlsx');
@@ -2039,6 +2073,55 @@ function drugMessage(i) {
   return buildMessage(f.customerName, [f], [], f.kind || 'chronic');
 }
 
+// ---------- حالة الرفع ----------
+// كل رفع بيتسجل في "uploads": إمتى بالساعة والدقيقة، مين رفعه، اسم الملف، والفترة اللي فيه.
+// عشان أي حد يعرف المبيعات واصلة لحد فين، والملف الجاي يبدأ من إمتى.
+const UPLOAD_LABEL = { sales: 'مبيعات', phones: 'أرقام عملاء', items: 'جدول الأصناف', lapsed: 'بعُدوا عننا' };
+async function logUpload(entry) {
+  const at = new Date().toISOString();
+  try { await storePatch('uploads', at, { ...entry, at, by: S.me || '' }); }
+  catch (e) { console.warn('upload log not saved', e); }   // السجل مايوقفش الرفع نفسه
+}
+// قبل ما سجل الرفع يتعمل: آخر تاريخ شراء موجود في المتابعات = آخر مبيعات اترفعت تقريبًا
+function inferredSalesEnd() {
+  let mx = '';
+  for (const f of S.followups) if (f.lastPurchaseDate && f.lastPurchaseDate > mx) mx = f.lastPurchaseDate;
+  return mx || null;
+}
+function fmtDay(d) {
+  if (!d) return '—';
+  const x = new Date(d + 'T12:00:00');
+  return isNaN(x) ? d : x.toLocaleDateString('ar-EG', { weekday: 'long' }) + ' ' + d;
+}
+function uploadStatusCard() {
+  const ups = S.uploads || [];
+  const lastSales = ups.find(u => u.type === 'sales' && u.dateTo);
+  const end = lastSales ? lastSales.dateTo : inferredSalesEnd();
+  const lastAny = ups[0];
+  let h = `<div class="card"><h2>📌 حالة الرفع</h2>`;
+  if (end) {
+    h += `<div class="good" style="white-space:normal">المبيعات في السيستم واصلة لحد: <b>${esc(fmtDay(end))}</b>`
+      + (lastSales ? '' : '<br><span class="meta">(تقدير من آخر تاريخ شراء في المتابعات — سجل الرفع بيبدأ من الرفع الجاي)</span>')
+      + `<br>➜ الملف الجاي يبدأ من: <b>${esc(fmtDay(addDays(end, 1)))}</b></div>`;
+  } else {
+    h += `<p class="meta">لسه مفيش مبيعات مرفوعة.</p>`;
+  }
+  if (lastAny) h += `<p class="meta">آخر رفع: <b>${esc(fmtTime(lastAny.at))}</b> — ${esc(UPLOAD_LABEL[lastAny.type] || lastAny.type)}
+    ${lastAny.by ? 'بواسطة ' + esc(lastAny.by) : ''}</p>`;
+  if (ups.length) {
+    h += `<div class="scroll" style="max-height:320px"><table><thead><tr>
+      <th>وقت الرفع</th><th>النوع</th><th>الفترة اللي في الملف</th><th>بواسطة</th><th>تفاصيل</th></tr></thead><tbody>
+      ${ups.slice(0, 20).map(u => `<tr>
+        <td style="white-space:nowrap">${esc(fmtTime(u.at))}</td>
+        <td>${esc(UPLOAD_LABEL[u.type] || u.type)}</td>
+        <td style="white-space:nowrap">${u.dateFrom ? esc(u.dateFrom) + ' ← ' + esc(u.dateTo) : '—'}</td>
+        <td>${esc(u.by || '—')}</td>
+        <td class="meta">${esc(u.file || '')}${u.rows ? ' • ' + u.rows + ' سطر' : ''}${u.newItems ? ' • ' + u.newItems + ' صنف جديد' : ''}${u.newCust ? ' • ' + u.newCust + ' عميل جديد' : ''}</td>
+      </tr>`).join('')}</tbody></table></div>`;
+  }
+  return h + `</div>`;
+}
+
 // ---------- شاشة 2: رفع البيانات ----------
 function viewUpload() {
   const unrev = S.items.filter(i => i.reviewed === false).length;
@@ -2049,6 +2132,7 @@ function viewUpload() {
   ${bkLate ? `<div class="warn">💾 ${bkDays === null ? 'لسه ماتعملتش نسخة احتياطية من الجهاز ده.' : 'آخر نسخة احتياطية من ' + bkDays + ' يوم.'}
     انزل لكارت "النسخة الاحتياطية" تحت ودوس الزرار.</div>` : ''}
   ${unrev ? `<div class="warn">فيه <b>${unrev}</b> صنف جديد لسه محتاج مراجعة في تبويب الأصناف.</div>` : ''}
+  ${uploadStatusCard()}
   <div class="card">
     <h2>1 · جدول الأصناف</h2>
     <p>ارفعه مرة واحدة في البداية. ده اللي بيحدد إيه المزمن وكل قد إيه يتجدد.</p>
@@ -2137,12 +2221,25 @@ function viewItems() {
     list = list.filter(i => i.isChronic && !(i.packUnits > 0 && i.dailyDose > 0));
   if (q) list = list.filter(i => i.itemName.includes(q));
   list = list.slice(0, 300);
+  S._itemList = list;
 
   const unrev = S.items.filter(i => i.reviewed === false).length;
+  // التقدم بيتحسب من أول ما زرار "تمام" اتضاف (reviewedAt) — المراجع قبل كده مش متسجل وقته
+  const done = S.items.filter(i => i.reviewedAt && i.reviewed !== false).length;
+  const pct = done + unrev ? Math.round(100 * done / (done + unrev)) : 100;
+  const pendShown = list.filter(i => i.reviewed === false).length;
 
   return `
-  ${unrev ? `<div class="warn"><b>${unrev}</b> صنف جديد ظهر في آخر رفع ولسه محتاج مراجعة.
-    راجعهم وحدد المزمن منهم عشان يدخلوا في المتابعة.</div>` : ''}
+  <div class="card">
+    <h2>✅ مراجعة الأصناف</h2>
+    ${unrev
+      ? `<p>باقي <b>${unrev}</b> صنف محتاج مراجعة${done ? ' • اتراجع <b>' + done + '</b>' : ''}.</p>
+         <div class="bar"><i style="width:${pct}%"></i></div>
+         <p class="meta">راجع كل صنف: لو مزمن شغّل المفتاح وظبط العبوة والجرعة. لو مش محتاج تعديل دوس <b>✓ تمام</b>.
+         أي تعديل في الصف بيعلّمه متراجع لوحده.</p>
+         ${pendShown ? `<button class="b" id="bRevAll" style="flex:0 0 auto">✓ تعليم الـ ${pendShown} المعروضين كمتراجعين</button>` : ''}`
+      : `<div class="good">مفيش أصناف محتاجة مراجعة 👌${done ? ' (اتراجع ' + done + ')' : ''}</div>`}
+  </div>
   <div class="fl" style="justify-content:flex-start">
     <button class="b" id="bExpItems" style="flex:0 0 auto">⬇ تصدير كل الأصناف (Excel)</button>
   </div>
@@ -2157,13 +2254,16 @@ function viewItems() {
     <input id="isrch" placeholder="بحث باسم الصنف" value="${esc(S.itemSearch)}">
   </div>
   <div class="scroll"><table>
-    <thead><tr><th>الصنف</th><th>مزمن</th><th>التصنيف</th>
+    <thead><tr><th>الصنف</th><th>مراجعة</th><th>مزمن</th><th>التصنيف</th>
       <th>وحدات العبوة</th><th>الجرعة/يوم</th><th>كل كام يوم</th></tr></thead>
     <tbody>${list.map(i => {
       const auto = (i.packUnits > 0 && i.dailyDose > 0);
       return `
       <tr>
         <td>${esc(i.itemName)}</td>
+        <td>${i.reviewed === false
+          ? `<button class="cp" data-rev="${esc(i.itemName)}">✓ تمام</button>`
+          : `<span class="meta" title="${esc(i.reviewedBy || '')}">✓</span>`}</td>
         <td><button class="sw ${i.isChronic?'on':''}" data-ch="${esc(i.itemName)}"><i></i></button></td>
         <td><input type="text" value="${esc(i.category||'')}" data-cat="${esc(i.itemName)}"></td>
         <td><input type="number" min="0" step="1" value="${i.packUnits ?? ''}" data-units="${esc(i.itemName)}"></td>
@@ -2217,11 +2317,25 @@ function viewItems() {
   </div>`;
 }
 
+function revStamp() { return { reviewed: true, reviewedAt: new Date().toISOString(), reviewedBy: S.me || '' }; }
 async function saveItem(name, patch) {
   const i = S.items.find(x => x.itemName === name);
-  if (i) Object.assign(i, patch, { reviewed: true });
-  try { await storePatch('items', cleanId(name), { ...patch, reviewed: true }); }
+  const st = revStamp();
+  if (i) Object.assign(i, patch, st);
+  try { await storePatch('items', cleanId(name), { ...patch, ...st }); }
   catch (e) { console.warn(e); }
+}
+// صنف اتراجع ومش محتاج تعديل (غالبًا غير مزمن)
+async function markReviewed(names) {
+  const st = revStamp();
+  const rows = [];
+  for (const n of names) {
+    const i = S.items.find(x => x.itemName === n);
+    if (!i || i.reviewed !== false) continue;
+    Object.assign(i, st);
+    rows.push({ _id: n, ...st });
+  }
+  if (rows.length) await storePut('items', rows);
 }
 
 // ============================================================================
@@ -2411,6 +2525,20 @@ function wire() {
   const isr = document.getElementById('isrch');
   if (isr) isr.addEventListener('change', e => { S.itemSearch = e.target.value; render(); });
 
+  on('[data-rev]', 'click', async e => {
+    try { await markReviewed([e.currentTarget.dataset.rev]); }
+    catch (err) { alert('لم يُحفظ: ' + (err.message || err)); }
+    render();
+  });
+  const bRevAll = document.getElementById('bRevAll');
+  if (bRevAll) bRevAll.addEventListener('click', async () => {
+    const names = (S._itemList || []).filter(i => i.reviewed === false).map(i => i.itemName);
+    if (!names.length || !confirm(names.length + ' صنف هيتعلّموا متراجعين ويفضلوا غير مزمنين (إلا اللي إنت شغّلته). تمام؟')) return;
+    bRevAll.disabled = true;
+    try { await markReviewed(names); }
+    catch (err) { alert('لم يُحفظ: ' + (err.message || err)); }
+    render();
+  });
   on('[data-ch]', 'click', async e => {
     const n = e.currentTarget.dataset.ch;
     const i = S.items.find(x => x.itemName === n);
@@ -2489,7 +2617,7 @@ function wire() {
     if (!confirm('تأكيد أخير: مفيش رجوع بعد كده.')) return;
     try {
       const { deleteDoc } = await import('https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js');
-      for (const c of COLS) {
+      for (const c of [...COLS, 'uploads']) {
         const snap = await getDocs(collection(db, c));
         for (let i = 0; i < snap.docs.length; i += 400) {
           const b = writeBatch(db);
@@ -2519,6 +2647,7 @@ function wire() {
     const p = progressBox('pItems');
     try {
       const n = await uploadItemsTable(f, p);
+      await logUpload({ type: 'items', file: f.name, rows: n });
       await loadAll();
       document.getElementById('pItems').innerHTML =
         `<div class="good">تم رفع ${n} صنف بنجاح.</div>`;
@@ -2537,6 +2666,10 @@ function wire() {
     const p = progressBox('pSales');
     try {
       const r = await uploadSales(f, p);
+      await logUpload(r.phonesOnly
+        ? { type: 'phones', file: f.name, rows: r.registered }
+        : { type: 'sales', file: f.name, rows: r.scanned, dateFrom: r.dateFrom, dateTo: r.dateTo,
+            customers: r.customers, newItems: r.newItems, newCust: r.newCust || 0 });
       await loadAll();
       if (r.phonesOnly) {
         document.getElementById('pSales').innerHTML = `<div class="good">تم رفع ملف الأرقام ✅
@@ -2567,6 +2700,7 @@ ${r.revived ? '\n✅ ' + r.revived + ' عميل من قايمة "بعُدوا ع
     const p = progressBox('pLap');
     try {
       const r = await uploadLapsed(f, p);
+      await logUpload({ type: 'lapsed', file: f.name, rows: r.count });
       await loadAll();
       document.getElementById('pLap').innerHTML =
         `<div class="good">تم رفع ${r.count} عميل (${r.withPhone} منهم عندهم رقم).</div>`;
