@@ -739,11 +739,13 @@ function custColOf(keys) {
 // عمود الرقم: مش لازم اسمه يكون مظبوط — بناخد العمود اللي فيه أكتر أرقام موبايل صالحة
 function phoneColOf(rows, keys) {
   const nk = custColOf(keys);
+  const named = k => /تليفون|تلفون|هاتف|موبايل|محمول|جوال|phone|mobile/i.test(String(k));
   let best = null, bestN = 0;
   for (const k of keys) {
     if (k === nk) continue;
     let n = 0;
     for (const r of rows.slice(0, 300)) if (normalizePhones(r[k]).length) n++;
+    if (n && named(k)) return k;                 // عمود اسمه تليفون وفيه أرقام = هو ده
     if (n > bestN) { best = k; bestN = n; }
   }
   return best;
@@ -766,6 +768,8 @@ async function uploadSales(file, setProg) {
     if (hasItem && hasCust && !salesRows) salesRows = rows;
     else if (!phoneRows && custColOf(keys) && phoneColOf(rows, keys)) phoneRows = rows;
   }
+  // ملف الكاشير ممكن يبقى شيت واحد: المبيعات وفيها عمود "رقم التليفون" — ناخد الأرقام منه
+  if (salesRows && !phoneRows && phoneColOf(salesRows, Object.keys(salesRows[0]))) phoneRows = salesRows;
   if (!salesRows && !phoneRows) throw new Error('لم أجد شيت المبيعات ولا شيت الأرقام. لازم يكون فيه "اسم العميل" و"الصنف" أو "اسم العميل" وعمود فيه أرقام موبايل.');
 
   // 1) خريطة الأرقام
