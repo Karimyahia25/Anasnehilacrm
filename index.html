@@ -547,10 +547,15 @@ async function syncCol(name) {
     const r = await storeAll(name); lastReads += r.length; return r;
   }
 }
+// Firestore بيرفض أي id زي "__epoch__" (محجوز) — عشان كده المكان meta/epoch
+async function bumpEpoch() {
+  try { await setDoc(doc(db, 'meta', 'epoch'), { value: Date.now() }); }
+  catch (e) { console.warn('epoch not saved', e); }
+}
 // لو حد مسح كل البيانات من جهاز تاني، باقي الأجهزة لازم ترمي الذاكرة بتاعتها
 async function checkEpoch() {
   try {
-    const snap = await getDoc(doc(db, 'staff', '__epoch__'));
+    const snap = await getDoc(doc(db, 'meta', 'epoch'));
     const remote = snap.exists() ? snap.data().value : 0;
     const local = await idbGet('meta', '__epoch__');
     if (local !== undefined && local !== remote) await idbClear();
@@ -689,22 +694,24 @@ async function uploadItemsTable(file, setProg) {
     const inFile = new Set(out.map(r => r.itemName));
     const posNames = new Set(out.map(r => r.posName).filter(Boolean));
     const codes = new Set(out.map(r => r.itemCode).filter(Boolean).map(String));
-    const extra = S.items.filter(i => !inFile.has(i.itemName));
+    // من السيرفر مباشرة مش من ذاكرة الجهاز — الذاكرة ممكن يكون فيها أصناف اتمسحت
+    const live = (await storeAll('items')).map(d => ({ ...d, itemName: d.itemName || d._id }));
+    const extra = live.filter(i => !inFile.has(i.itemName));
     const dups = extra.filter(i => posNames.has(i.itemName) || (i.itemCode && codes.has(String(i.itemCode))));
     const fresh = extra.filter(i => !dups.includes(i) && i.reviewed !== false);
     if (dups.length) {
       setProg(97, `جاري مسح ${dups.length} صنف مكرر...`);
-      for (const i of dups) await deleteDoc(doc(db, 'items', cleanId(i.itemName)));
+      for (const i of dups) await deleteDoc(doc(db, 'items', i._id));
       removed = dups.length;
-      // المسح مابيوصلش لذاكرة الأجهزة التانية — نخلي كل الأجهزة تعيد التحميل مرة
-      await setDoc(doc(db, 'staff', '__epoch__'), { value: Date.now() });
-      try { await idbClear(); } catch (e) {}
     }
     if (fresh.length) {
       setProg(98, `جاري تعليم ${fresh.length} صنف جديد للمراجعة...`);
-      await storePut('items', fresh.map(i => ({ _id: i.itemName, reviewed: false })));
+      await storePut('items', fresh.map(i => ({ _id: i._id, reviewed: false })));
       flagged = fresh.length;
     }
+    // كل الأجهزة (والجهاز ده) تعيد تحميل البيانات مرة — عشان المسح والاسترجاع يوصلوا للكل
+    await bumpEpoch();
+    try { await idbClear(); } catch (e) {}
   }
   setProg(100, 'تم.');
   return { count: out.length, flagged, removed, isBackup };
@@ -2718,7 +2725,7 @@ function wire() {
           await b.commit();
         }
       }
-      await setDoc(doc(db, 'staff', '__epoch__'), { value: Date.now() });
+      await bumpEpoch();
       try { await idbClear(); } catch (e) {}
       location.reload();
     } catch (e) { alert('فشل المسح: ' + (e.message || e)); }
