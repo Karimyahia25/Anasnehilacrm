@@ -632,8 +632,17 @@ async function uploadItemsTable(file, setProg) {
   const X = await ensureXlsx();
   setProg(10, 'جاري قراءة الملف...');
   const wb = X.read(new Uint8Array(await file.arrayBuffer()), { type: 'array', cellDates: true });
-  const rows = X.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { defval: '' });
+  // شيت "الأصناف" لو موجود — عشان النسخة الاحتياطية وملف تصدير الأصناف يترفعوا زي ما هما
+  const sn = wb.SheetNames.includes('الأصناف') ? 'الأصناف' : wb.SheetNames[0];
+  const rows = X.utils.sheet_to_json(wb.Sheets[sn], { defval: '' });
   if (!rows.length) throw new Error('الملف فارغ.');
+  const keys = Object.keys(rows[0]).map(k => String(k).trim());
+  // ملف مبيعات اترفع هنا بالغلط بيمسح المزمن والجرعات من كل الأصناف اللي فيه — نرفضه
+  if (keys.some(k => ['اسم العميل', 'أسم العميل', 'التاريخ', 'كود البيع'].includes(k)))
+    throw new Error('ده ملف مبيعات، مش جدول أصناف ❌ — ارفعه من كارت "2 · ملف المبيعات". ماتغيرش أي حاجة.');
+  if (!keys.some(k => ['مزمن؟', 'مزمن', 'isChronic'].includes(k)))
+    throw new Error('الملف مافيهوش عمود "مزمن؟" — مش جدول أصناف. ماتغيرش أي حاجة.');
+  const isBackup = keys.includes('itemName') && keys.includes('isChronic');
 
   const out = [];
   for (const r of rows) {
@@ -651,7 +660,11 @@ async function uploadItemsTable(file, setProg) {
       packUnits: Number.isFinite(units) && units > 0 ? units : null,
       dailyDose: Number.isFinite(dose)  && dose  > 0 ? dose  : null,
       cycleDays: calcCycle(units, dose, cyc),
-      reviewed: true,
+      // من النسخة الاحتياطية: الصنف اللي كان لسه محتاج مراجعة يفضل كده
+      reviewed: !(String(pick(r, ['reviewed']) ?? '').trim().toLowerCase() === 'false' ||
+                  String(pick(r, ['محتاج مراجعة']) ?? '').trim() === 'نعم'),
+      ...(String(pick(r, ['الاسم في الكاشير', 'posName']) ?? '').trim()
+        ? { posName: String(pick(r, ['الاسم في الكاشير', 'posName'])).trim() } : {}),
       ...(String(pick(r, ['كود الصنف', 'itemCode']) ?? '').trim()
         ? { itemCode: String(pick(r, ['كود الصنف', 'itemCode'])).trim() } : {})
     });
@@ -668,8 +681,33 @@ async function uploadItemsTable(file, setProg) {
     setProg(97, `جاري فك الكود من ${clear.length} اسم مكرر...`);
     await storePut('items', clear.map(i => ({ _id: i.itemName, itemCode: null })));
   }
+  // استرجاع من نسخة احتياطية: الأصناف اللي ظهرت بعد النسخة ترجع "محتاج مراجعة" عشان تتراجع تاني
+  // صنف مش في النسخة واسمه هو "اسم الكاشير" لصنف تاني، أو واخد كود صنف تاني = نسخة مكررة
+  // اتعملت بالغلط (ملف مبيعات اترفع في الكارت ده) — بتتمسح عشان الكود يرجع لصاحبه.
+  let flagged = 0, removed = 0;
+  if (isBackup) {
+    const inFile = new Set(out.map(r => r.itemName));
+    const posNames = new Set(out.map(r => r.posName).filter(Boolean));
+    const codes = new Set(out.map(r => r.itemCode).filter(Boolean).map(String));
+    const extra = S.items.filter(i => !inFile.has(i.itemName));
+    const dups = extra.filter(i => posNames.has(i.itemName) || (i.itemCode && codes.has(String(i.itemCode))));
+    const fresh = extra.filter(i => !dups.includes(i) && i.reviewed !== false);
+    if (dups.length) {
+      setProg(97, `جاري مسح ${dups.length} صنف مكرر...`);
+      for (const i of dups) await deleteDoc(doc(db, 'items', cleanId(i.itemName)));
+      removed = dups.length;
+      // المسح مابيوصلش لذاكرة الأجهزة التانية — نخلي كل الأجهزة تعيد التحميل مرة
+      await setDoc(doc(db, 'staff', '__epoch__'), { value: Date.now() });
+      try { await idbClear(); } catch (e) {}
+    }
+    if (fresh.length) {
+      setProg(98, `جاري تعليم ${fresh.length} صنف جديد للمراجعة...`);
+      await storePut('items', fresh.map(i => ({ _id: i.itemName, reviewed: false })));
+      flagged = fresh.length;
+    }
+  }
   setProg(100, 'تم.');
-  return out.length;
+  return { count: out.length, flagged, removed, isBackup };
 }
 
 // كتابة على دفعات محليًا
@@ -2189,7 +2227,8 @@ function viewUpload() {
   ${uploadStatusCard()}
   <div class="card">
     <h2>1 · جدول الأصناف</h2>
-    <p>ارفعه مرة واحدة في البداية. ده اللي بيحدد إيه المزمن وكل قد إيه يتجدد.</p>
+    <p>ارفعه مرة واحدة في البداية. ده اللي بيحدد إيه المزمن وكل قد إيه يتجدد.
+      <b>مش لملف المبيعات.</b> ممكن كمان ترفع هنا ملف النسخة الاحتياطية عشان ترجّع الأصناف زي ما كانت.</p>
     <input type="file" id="fItems" accept=".xlsx,.xls,.csv">
     <button class="big" id="bItems">رفع جدول الأصناف</button>
     <div id="pItems"></div>
@@ -2700,11 +2739,12 @@ function wire() {
     bItems.disabled = true;
     const p = progressBox('pItems');
     try {
-      const n = await uploadItemsTable(f, p);
-      await logUpload({ type: 'items', file: f.name, rows: n });
+      const r = await uploadItemsTable(f, p);
+      await logUpload({ type: 'items', file: f.name, rows: r.count });
       await loadAll();
-      document.getElementById('pItems').innerHTML =
-        `<div class="good">تم رفع ${n} صنف بنجاح.</div>`;
+      document.getElementById('pItems').innerHTML = `<div class="good">${r.isBackup
+        ? 'تم استرجاع ' + r.count + ' صنف من النسخة الاحتياطية ✅' + (r.removed ? '\n• ' + r.removed + ' صنف مكرر اتمسح' : '') + (r.flagged ? '\n• ' + r.flagged + ' صنف ظهر بعد النسخة — اتعلّم "محتاج مراجعة"' : '')
+        : 'تم رفع ' + r.count + ' صنف بنجاح.'}</div>`;
     } catch (e) {
       document.getElementById('pItems').innerHTML = `<div class="err">${esc(e.message || e)}</div>`;
     }
